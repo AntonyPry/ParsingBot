@@ -15,6 +15,7 @@ export const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // При старте бота /start
 bot.onText(/\/start/, async (msg) => {
+  console.log('chatId ->', msg.chat.id);
   const chatId = msg.chat.id;
 
   // Проверяем, есть ли у нас конфиг для этого пользователя
@@ -45,6 +46,7 @@ bot.onText(/\/start/, async (msg) => {
 
 // Обработка нажатия кнопки "Сменить регион"
 bot.on('message', async (msg) => {
+  console.log('message chatId ->', msg.chat.id);
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
 
