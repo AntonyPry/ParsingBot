@@ -21,8 +21,7 @@ cron.schedule('* * * * *', async () => {
     const configs = await Configuration.findAll();
 
     for (const cfg of configs) {
-      console.log('cfg', cfg);
-      const userId = cfg.userId;
+      const userId = cfg.dataValues.userId;
 
       // 2. Достаём из cfg.configData нужный параметр, например region
       //    Предположим, configData хранится как JSON {"region":"Санкт-Петербург - 78"}
