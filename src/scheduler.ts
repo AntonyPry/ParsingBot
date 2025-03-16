@@ -20,6 +20,8 @@ cron.schedule('* * * * *', async () => {
     // 1. Получаем всех пользователей (конфигурации)
     const configs = await Configuration.findAll();
 
+    console.log('configs', configs);
+
     for (const cfg of configs) {
       const userId = cfg.userId;
 
@@ -92,7 +94,6 @@ cron.schedule('* * * * *', async () => {
 
       // 7. Обрабатываем записи
       for (const row of records) {
-        console.log(row);
         const uniqueNumber = row['Номер заключения экспертизы'] || '';
         if (!uniqueNumber) continue;
 
