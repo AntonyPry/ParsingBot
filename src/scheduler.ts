@@ -20,9 +20,8 @@ cron.schedule('* * * * *', async () => {
     // 1. Получаем всех пользователей (конфигурации)
     const configs = await Configuration.findAll();
 
-    console.log('configs', configs);
-
     for (const cfg of configs) {
+      console.log('cfg', cfg);
       const userId = cfg.userId;
 
       // 2. Достаём из cfg.configData нужный параметр, например region
