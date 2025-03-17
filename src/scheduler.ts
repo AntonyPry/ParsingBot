@@ -30,7 +30,7 @@ cron.schedule('* * * * *', async () => {
           region = parsed.region;
         }
       } catch (e) {
-        console.error('configData не в JSON-формате, используем по умолчанию');
+        console.error(`${userId} -> configData не в JSON-формате, используем по умолчанию`);
       }
 
       // 3. Строим фильтр. Пример: date(...) + contains(tolower(SubjectRf), tolower('region'))

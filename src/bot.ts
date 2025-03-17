@@ -76,12 +76,12 @@ bot.on('message', async (msg) => {
       // Создаём, если нет
       config = await Configuration.create({
         userId: chatId,
-        configData: `{ region: ${regionValue} }`,
+        configData: JSON.stringify({ region: regionValue }),
       });
     } else {
       // Обновляем
       console.log('обновление конфига ->', chatId, `{ region: ${regionValue} }`);
-      await config.update({ configData: `{ region: ${regionValue} }` });
+      await config.update({ configData: JSON.stringify({ region: regionValue }) });
     }
 
     await bot.sendMessage(chatId, `Регион установлен: ${regionValue}`);
