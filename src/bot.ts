@@ -72,6 +72,7 @@ bot.on('message', async (msg) => {
 
     // Сохраняем в БД (Configuration)
     let config = await Configuration.findOne({ where: { userId: chatId } });
+    console.log('config', config);
     if (!config) {
       // Создаём, если нет
       config = await Configuration.create({
@@ -80,10 +81,11 @@ bot.on('message', async (msg) => {
       });
     } else {
       // Обновляем
+      console.log('обновление конфига ->', chatId, regionValue);
       await config.update({ configData: regionValue });
     }
 
-    await bot.sendMessage(chatId, `Регион установлен: ${regionName}`);
+    await bot.sendMessage(chatId, `Регион установлен: ${regionValue}`);
     return;
   }
 });
