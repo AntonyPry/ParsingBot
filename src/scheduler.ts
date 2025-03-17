@@ -23,10 +23,7 @@ cron.schedule('* * * * *', async () => {
     for (const cfg of configs) {
       const userId = cfg.dataValues.userId;
 
-      // 2. Достаём из cfg.configData нужный параметр, например region
-      //    Предположим, configData хранится как JSON {"region":"Санкт-Петербург - 78"}
       let region = 'Санкт-Петербург - 78';
-      // Если у вас JSON — распарсим:
       try {
         const parsed = JSON.parse(cfg.configData || '{}');
         if (parsed.region) {
