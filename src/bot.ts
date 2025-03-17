@@ -63,7 +63,8 @@ bot.on('message', async (msg) => {
     awaitingRegionCode.delete(chatId);
 
     // Проверяем, есть ли такой код
-    const regionName = `${REGIONS[text]} - ${text}`;
+    const regionName = REGIONS[text];
+    const regionValue = `${REGIONS[text]} - ${text}`;
     if (!regionName) {
       await bot.sendMessage(chatId, 'Код региона не найден. Попробуйте снова «Сменить регион».');
       return;
@@ -75,12 +76,11 @@ bot.on('message', async (msg) => {
       // Создаём, если нет
       config = await Configuration.create({
         userId: chatId,
-        configData: JSON.stringify({ region: regionName }),
+        configData: regionValue,
       });
     } else {
       // Обновляем
-      config.configData = JSON.stringify({ region: regionName });
-      await config.save();
+      await config.update({ configData: regionValue });
     }
 
     await bot.sendMessage(chatId, `Регион установлен: ${regionName}`);
