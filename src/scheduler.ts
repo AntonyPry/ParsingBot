@@ -26,6 +26,7 @@ cron.schedule('* * * * *', async () => {
       let region = 'Санкт-Петербург - 78';
       try {
         const parsed = JSON.parse(cfg.configData || '{}');
+        console.log('parsed', parsed);
         if (parsed.region) {
           region = parsed.region;
         }
