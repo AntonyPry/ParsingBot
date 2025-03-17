@@ -80,7 +80,7 @@ bot.on('message', async (msg) => {
       });
     } else {
       // Обновляем
-      console.log('обновление конфига ->', chatId, `{ region: ${regionValue} }`);
+      console.log('обновление конфига ->', chatId, JSON.stringify({ region: regionValue }));
       await config.update({ configData: JSON.stringify({ region: regionValue }) });
     }
 
