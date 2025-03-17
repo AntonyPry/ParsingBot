@@ -22,11 +22,12 @@ cron.schedule('* * * * *', async () => {
 
     for (const cfg of configs) {
       const userId = cfg.dataValues.userId;
+      console.log(cfg.dataValues);
 
       let region = 'Санкт-Петербург - 78';
       try {
-        const parsed = JSON.parse(cfg.configData || '{}');
-        console.log('parsed', parsed);
+        const parsed = JSON.parse(cfg.dataValues.configData || '{}');
+        console.log(parsed);
         if (parsed.region) {
           region = parsed.region;
         }
