@@ -72,7 +72,6 @@ bot.on('message', async (msg) => {
 
     // Сохраняем в БД (Configuration)
     let config = await Configuration.findOne({ where: { userId: chatId } });
-    console.log('config', config);
     if (!config) {
       // Создаём, если нет
       config = await Configuration.create({
