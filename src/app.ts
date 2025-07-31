@@ -5,7 +5,7 @@ app.use(express.json());
 
 // Пример: проверочный роут
 app.get('/', (req, res) => {
-  res.send('Сервер работает');
+	res.send('Сервер работает');
 });
 
 export { app };

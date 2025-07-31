@@ -1,90 +1,166 @@
-// src/bot.ts
 import TelegramBot from 'node-telegram-bot-api';
 import { BOT_TOKEN } from './config';
 import { Configuration } from './database/models/Configuration';
 import { REGIONS } from './constants/regions';
-
-// Храним список chatId, которые сейчас ввели «Сменить регион» и ждём, пока они отправят код
-const awaitingRegionCode = new Set<number>();
+import { IUserConfig } from './types/config.types';
+// --- ИЗМЕНЕНИЕ: Импортируем новую функцию ---
+import { triggerImmediateParse } from './scheduler';
 
 if (!BOT_TOKEN) {
-  throw new Error('BOT_TOKEN не задан в .env');
+	throw new Error('BOT_TOKEN не задан в .env');
 }
+
+const userAction = new Map<number, 'add_region' | 'remove_region'>();
 
 export const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// При старте бота /start
+const MAIN_KEYBOARD = {
+	reply_markup: {
+		keyboard: [
+			[{ text: '➕ Добавить регион' }, { text: '➖ Удалить регион' }],
+			[{ text: 'Мои регионы' }],
+		],
+		resize_keyboard: true,
+	},
+};
+
+// --- Хелперы для чистоты кода ---
+
+async function getUserConfig(chatId: number): Promise<IUserConfig> {
+	const config = await Configuration.findOne({ where: { userId: chatId } });
+	if (config?.configData) {
+		try {
+			const parsed = JSON.parse(config.configData);
+			if (Array.isArray(parsed.regions)) {
+				return parsed;
+			}
+		} catch (e) {
+			// Игнорируем ошибки
+		}
+	}
+	return { regions: [] };
+}
+
+async function saveUserConfig(chatId: number, userConfig: IUserConfig) {
+	await Configuration.upsert({
+		userId: chatId,
+		configData: JSON.stringify(userConfig),
+	});
+}
+
+// --- Основные обработчики ---
+
 bot.onText(/\/start/, async (msg) => {
-  console.log('chatId ->', msg.chat.id);
-  const chatId = msg.chat.id;
-
-  // Проверяем, есть ли у нас конфиг для этого пользователя
-  let config = await Configuration.findOne({ where: { userId: chatId } });
-
-  // Если нет — создаём запись, сразу спрашиваем регион
-  if (!config) {
-    awaitingRegionCode.add(chatId);
-    await bot.sendMessage(chatId, 'Добро пожаловать! Введите код региона (например, 35).', {
-      reply_markup: {
-        // Клавиатура с одной кнопкой «Сменить регион»
-        keyboard: [[{ text: 'Сменить регион' }]],
-        resize_keyboard: true,
-        one_time_keyboard: false,
-      },
-    });
-  } else {
-    // Если конфиг уже есть — просто приветствуем
-    await bot.sendMessage(chatId, 'С возвращением! Используйте кнопку «Сменить регион», если нужно.', {
-      reply_markup: {
-        keyboard: [[{ text: 'Сменить регион' }]],
-        resize_keyboard: true,
-        one_time_keyboard: false,
-      },
-    });
-  }
+	const chatId = msg.chat.id;
+	await bot.sendMessage(
+		chatId,
+		'Добро пожаловать! Используйте кнопки для управления регионами.',
+		MAIN_KEYBOARD,
+	);
 });
 
-// Обработка нажатия кнопки "Сменить регион"
 bot.on('message', async (msg) => {
-  console.log('message chatId ->', msg.chat.id);
-  const chatId = msg.chat.id;
-  const text = (msg.text || '').trim();
+	const chatId = msg.chat.id;
+	const text = (msg.text || '').trim();
+	
+	if (userAction.has(chatId)) {
+		const action = userAction.get(chatId);
+		userAction.delete(chatId);
+		
+		if (action === 'add_region') {
+			await handleAddRegion(chatId, text);
+		}
+		return;
+	}
+	
+	switch (text) {
+		case '➕ Добавить регион':
+			userAction.set(chatId, 'add_region');
+			await bot.sendMessage(chatId, 'Введите код региона для добавления (например, 78 - Санкт-Петербург).');
+			break;
+		
+		case '➖ Удалить регион':
+			await showRegionsForDeletion(chatId);
+			break;
+		
+		case 'Мои регионы':
+			const currentConfig = await getUserConfig(chatId);
+			if (currentConfig.regions.length === 0) {
+				await bot.sendMessage(chatId, 'У вас пока нет добавленных регионов.');
+			} else {
+				await bot.sendMessage(chatId, `Ваши регионы:\n- ${currentConfig.regions.join('\n- ')}`);
+			}
+			break;
+	}
+});
 
-  // Если пользователь жмёт «Сменить регион» — предлагаем ввести код
-  if (text === 'Сменить регион') {
-    awaitingRegionCode.add(chatId);
-    await bot.sendMessage(chatId, 'Введите код региона (например, 35).');
-    return;
-  }
+// --- Логика добавления региона ---
 
-  // Если пользователь в режиме «ждём код»
-  if (awaitingRegionCode.has(chatId)) {
-    // Снимаем режим ожидания
-    awaitingRegionCode.delete(chatId);
+async function handleAddRegion(chatId: number, regionCode: string) {
+	const regionName = REGIONS[regionCode];
+	if (!regionName) {
+		await bot.sendMessage(chatId, 'Код региона не найден. Попробуйте снова');
+		return;
+	}
+	
+	const regionValue = `${regionName} - ${regionCode}`;
+	const config = await getUserConfig(chatId);
+	
+	if (config.regions.includes(regionValue)) {
+		await bot.sendMessage(chatId, `Регион "${regionName}" уже есть в вашем списке.`);
+		return;
+	}
+	
+	config.regions.push(regionValue);
+	await saveUserConfig(chatId, config);
+	
+	await bot.sendMessage(chatId, `✅ Регион "${regionName}" успешно добавлен!`, MAIN_KEYBOARD);
+	
+	// --- НОВЫЙ БЛОК: Запуск немедленной проверки для нового региона ---
+	await bot.sendMessage(chatId, '🚀 Запускаю первоначальный поиск по новому региону. Это может занять минуту...');
+	// Вызываем функцию, которая выполнит поиск и отправит результат пользователю
+	await triggerImmediateParse(regionValue, chatId);
+}
 
-    // Проверяем, есть ли такой код
-    const regionName = REGIONS[text];
-    const regionValue = `${REGIONS[text]} - ${text}`;
-    if (!regionName) {
-      await bot.sendMessage(chatId, 'Код региона не найден. Попробуйте снова «Сменить регион».');
-      return;
-    }
+// --- Логика удаления региона ---
 
-    // Сохраняем в БД (Configuration)
-    let config = await Configuration.findOne({ where: { userId: chatId } });
-    if (!config) {
-      // Создаём, если нет
-      config = await Configuration.create({
-        userId: chatId,
-        configData: JSON.stringify({ region: regionValue }),
-      });
-    } else {
-      // Обновляем
-      console.log('обновление конфига ->', chatId, JSON.stringify({ region: regionValue }));
-      await config.update({ configData: JSON.stringify({ region: regionValue }) });
-    }
+async function showRegionsForDeletion(chatId: number) {
+	const config = await getUserConfig(chatId);
+	if (config.regions.length === 0) {
+		await bot.sendMessage(chatId, 'Нечего удалять. У вас нет добавленных регионов.', MAIN_KEYBOARD);
+		return;
+	}
+	
+	const inlineKeyboard = config.regions.map(region => ([{
+		text: `❌ ${region}`,
+		callback_data: `delete_region:${region}`,
+	}]));
+	
+	await bot.sendMessage(chatId, 'Нажмите на регион, чтобы его удалить:', {
+		reply_markup: {
+			inline_keyboard: inlineKeyboard,
+		},
+	});
+}
 
-    await bot.sendMessage(chatId, `Регион установлен: ${regionValue}`);
-    return;
-  }
+bot.on('callback_query', async (callbackQuery) => {
+	const message = callbackQuery.message;
+	if (!message) return;
+	const chatId = message.chat.id;
+	const data = callbackQuery.data;
+	
+	if (data?.startsWith('delete_region:')) {
+		const regionToDelete = data.substring('delete_region:'.length);
+		const config = await getUserConfig(chatId);
+		
+		config.regions = config.regions.filter(r => r !== regionToDelete);
+		await saveUserConfig(chatId, config);
+		
+		await bot.answerCallbackQuery(callbackQuery.id, { text: `Регион "${regionToDelete}" удален.` });
+		
+		await bot.editMessageText('Регион удален. Вы можете удалить еще, нажав кнопку "Удалить регион" снова.', {
+			chat_id: chatId,
+			message_id: message.message_id,
+		});
+	}
 });
