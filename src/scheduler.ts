@@ -9,9 +9,9 @@ import { ParsedData } from './database/models/ParsedData';
 import { IEgrzRecord } from './types/egrz.types';
 import { IUserConfig } from './types/config.types';
 import { processLeadWithAI } from './services/aiService';
-import * as cheerio from 'cheerio';
 import { ProcessedLead } from './database/models/ProcessedLead';
-import { SCRAPER_ENABLED } from './config';
+import { logger } from './logger';
+import { Op } from 'sequelize';
 
 // =================================================================================
 // ВАЖНО: Настройка для совместимости со старым API egrz.ru
@@ -20,274 +20,502 @@ const httpsAgent = new https.Agent({
 	secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
 });
 
+// =================================================================================
+// КОНФИГУРАЦИЯ И КОНСТАНТЫ
+// =================================================================================
+const SCHEDULER_CONFIG = {
+	// Максимальное время выполнения одной задачи (30 минут)
+	MAX_EXECUTION_TIME: 30 * 60 * 1000,
+	// Таймаут для HTTP запросов (30 секунд)
+	HTTP_TIMEOUT: 30 * 1000,
+	// Максимальное количество записей с API за раз
+	MAX_RECORDS_PER_REQUEST: 100,
+	// Максимальное количество повторных попыток
+	MAX_RETRIES: 3,
+	// Задержка между повторными попытками (мс)
+	RETRY_DELAY: 5000,
+};
 
 // =================================================================================
-// БЛОК: Функции для поиска информации в интернете (скрапинг)
-// Логика этих функций остается без изменений.
+// ИНТЕРФЕЙСЫ ДЛЯ ТИПИЗАЦИИ
 // =================================================================================
-
-function extractSearchQuery(developerInfo: string): string | null {
-	if (!developerInfo) return null;
-	const innMatch = developerInfo.match(/ИНН:?\s*(\d{10,12})/);
-	if (innMatch && innMatch[1]) return `ИНН ${innMatch[1]}`;
-	const ogrnMatch = developerInfo.match(/ОГРНИП?:?\s*(\d{13,15})/);
-	if (ogrnMatch && ogrnMatch[1]) return `ОГРН ${ogrnMatch[1]}`;
-	const companyNameMatch = developerInfo.match(/^([^()]+)/);
-	if (companyNameMatch && companyNameMatch[1]) return companyNameMatch[1].trim();
-	return developerInfo;
+interface RegionUserMap {
+	region: string;
+	userIds: number[];
 }
 
-async function findBeneficiaryInfo(developerInfo: string): Promise<string> {
-	if (!developerInfo || developerInfo.trim().toLowerCase() === 'не требуется') {
-		return 'В исходных данных не указан застройщик.';
-	}
-	const apiKey = process.env.GOOGLE_SEARCH_API_KEY;
-	const searchEngineId = process.env.SEARCH_ENGINE_ID;
-	if (!apiKey || !searchEngineId) return 'Поиск в интернете не настроен.';
-	const innOrOgrn = extractSearchQuery(developerInfo);
-	const companyName = (developerInfo.match(/^([^()]+)/)?.[1] || '').trim();
-	if (!companyName) return 'Не удалось извлечь название компании.';
-	const queries = [
-		`"${companyName}" ${innOrOgrn} руководитель официальный сайт`,
-		`"${companyName}" ${innOrOgrn} реквизиты`,
-		`"${companyName}" генеральный директор контакты`,
-	];
-	const searchUrl = `https://www.googleapis.com/customsearch/v1`;
-	for (const query of queries) {
-		try {
-			const searchResponse = await axios.get(searchUrl, { params: { key: apiKey, cx: searchEngineId, q: query } });
-			const firstResult = searchResponse.data.items?.[0];
-			if (firstResult && firstResult.link) {
-				try {
-					const pageResponse = await axios.get(firstResult.link, {
-						timeout: 5000,
-						headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' },
-					});
-					const html = pageResponse.data;
-					const $ = cheerio.load(html);
-					const pageText = $('body').text().replace(/\s\s+/g, ' ').trim();
-					if (pageText.length > 100) {
-						return pageText.substring(0, 4000);
-					}
-				} catch (scrapeError: any) {
-					console.error(`[SCRAPER] Ошибка при скрапинге ${firstResult.link}:`, scrapeError.message);
-				}
-			}
-		} catch (searchError: any) {
-			console.error(`[SCRAPER] Ошибка при поиске в Google:`, searchError.message);
+interface ProcessingResult {
+	region: string;
+	totalRecords: number;
+	processedRecords: number;
+	skippedRecords: number;
+	errorRecords: number;
+}
+
+// =================================================================================
+// ОСНОВНОЙ ПЛАНИРОВЩИК С ЗАЩИТОЙ ОТ БЛОКИРОВОК
+// =================================================================================
+let isTaskRunning = false;
+let taskStartTime: number = 0;
+
+cron.schedule('*/15 * * * *', async () => {
+	// Проверка блокировки
+	if (isTaskRunning) {
+		const currentTime = Date.now();
+		const executionTime = currentTime - taskStartTime;
+		
+		if (executionTime > SCHEDULER_CONFIG.MAX_EXECUTION_TIME) {
+			logger.error(`[SCHEDULER] КРИТИЧЕСКАЯ ОШИБКА: Задача выполняется более ${SCHEDULER_CONFIG.MAX_EXECUTION_TIME / 60000} минут. Принудительная разблокировка.`);
+			isTaskRunning = false;
+		} else {
+			logger.warn(`[SCHEDULER] Пропуск запуска: предыдущая задача выполняется уже ${Math.round(executionTime / 1000)} секунд.`);
+			return;
 		}
 	}
-	return 'Не удалось найти и обработать релевантные страницы.';
-}
-
-
-// =================================================================================
-// НОВЫЙ, ОПТИМИЗИРОВАННЫЙ ПЛАНИРОВЩИК
-// =================================================================================
-
-// Флаг-блокировщик, чтобы избежать параллельного запуска нескольких задач парсинга
-let isTaskRunning = false;
-
-// Рекомендуется установить более разумное расписание, например, раз в 15 минут.
-// '* * * * *' - каждую минуту (для тестов). '*/15 * * * *' - каждые 15 минут.
-cron.schedule('*/15 * * * *', async () => {
-	// -----------------------------------------------------------------------------
-	// ШАГ 0: ПРОВЕРКА БЛОКИРОВКИ
-	// -----------------------------------------------------------------------------
-	if (isTaskRunning) {
-		console.log('[SCHEDULER] Пропуск запуска: предыдущая задача еще не завершена.');
-		return;
-	}
-	console.log('[SCHEDULER] Запуск задачи парсинга...');
-	isTaskRunning = true; // Устанавливаем блокировку
+	
+	logger.info('[SCHEDULER] ==================== ЗАПУСК ЗАДАЧИ ПАРСИНГА ====================');
+	isTaskRunning = true;
+	taskStartTime = Date.now();
 	
 	try {
-		// -----------------------------------------------------------------------------
-		// ШАГ 1: СБОР УНИКАЛЬНЫХ РЕГИОНОВ И ПОДПИСЧИКОВ
-		// Вместо того чтобы итерироваться по пользователям, мы создаем карту,
-		// где ключ - это регион, а значение - массив ID пользователей,
-		// которые на него подписаны. Это главная оптимизация.
-		// -----------------------------------------------------------------------------
-		console.log('[SCHEDULER] Шаг 1/5: Сбор конфигураций и формирование списка уникальных регионов...');
-		const allConfigs = await Configuration.findAll();
-		const regionToUsersMap = new Map<string, number[]>();
-		
-		for (const config of allConfigs) {
-			try {
-				const userConfig: IUserConfig = JSON.parse(config.dataValues.configData);
-				if (userConfig.regions && userConfig.regions.length > 0) {
-					for (const region of userConfig.regions) {
-						if (!regionToUsersMap.has(region)) {
-							regionToUsersMap.set(region, []);
-						}
-						regionToUsersMap.get(region)!.push(config.dataValues.userId);
-					}
-				}
-			} catch (e) {
-				console.error(`[SCHEDULER] Ошибка парсинга конфигурации для пользователя ${config.dataValues.userId}:`, e);
-			}
-		}
-		
-		const uniqueRegions = Array.from(regionToUsersMap.keys());
-		if (uniqueRegions.length === 0) {
-			console.log('[SCHEDULER] Нет активных подписок на регионы. Задача завершена.');
-			return; // Выходим, если никто ни на что не подписан
-		}
-		console.log(`[SCHEDULER] Обнаружено уникальных регионов для парсинга: ${uniqueRegions.length}.`);
-		
-		
-		// -----------------------------------------------------------------------------
-		// ШАГ 2: ПОЛУЧЕНИЕ ДАННЫХ ДЛЯ КАЖДОГО УНИКАЛЬНОГО РЕГИОНА
-		// Теперь мы делаем только один запрос на регион, вне зависимости от
-		// количества подписчиков.
-		// -----------------------------------------------------------------------------
-		console.log('[SCHEDULER] Шаг 2/5: Получение данных из API ЕГРЗ...');
-		const todayMsk = '2024-05-20'; // Для тестов используется фиксированная дата
-		// const todayMsk = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).toISOString().split('T')[0];
-		
-		for (const region of uniqueRegions) {
-			let records: IEgrzRecord[] = [];
-			try {
-				const filter = `(date(ExpertiseConclusionDate) ge ${todayMsk}Z and date(ExpertiseConclusionDate) le ${todayMsk}T23:59:59.999Z and contains(tolower(SubjectRf),tolower('${region}')))`;
-				const response = await axios.get('https://open-api.egrz.ru/api/PublicRegistrationBook/openDataFile', {
-					params: { $filter: filter, $top: 100 }, // Увеличим лимит на всякий случай
-					httpsAgent,
-				});
-				
-				const cleanedCsv = (response.data as string).split('\n').filter(line => line.trim() && !line.includes('Дата и время генерации файла:') && line.includes(';')).join('\n');
-				if (!cleanedCsv) {
-					console.log(`[SCHEDULER] Для региона "${region}" нет новых данных.`);
-					continue;
-				}
-				
-				records = parse(cleanedCsv, { columns: true, delimiter: ';', skip_empty_lines: true });
-				console.log(`[SCHEDULER] Регион "${region}", найдено новых строк: ${records.length}`);
-			} catch (error) {
-				console.error(`[SCHEDULER] Критическая ошибка при получении данных для региона "${region}":`, error);
-				continue; // Пропускаем регион в случае ошибки, но продолжаем работу
-			}
-			
-			if (records.length === 0) continue;
-			
-			// -----------------------------------------------------------------------------
-			// ШАГ 3: ОБРАБОТКА КАЖДОЙ ЗАПИСИ (ЛИДА)
-			// -----------------------------------------------------------------------------
-			console.log(`[SCHEDULER] Шаг 3/5: Обработка ${records.length} записей для региона "${region}"...`);
-			for (const record of records) {
-				const uniqueNumber = record['Номер заключения экспертизы'];
-				if (!uniqueNumber) continue;
-				
-				// Пропускаем записи, где застройщик не требуется
-				const developerInfo = record['Сведения о застройщике, обеспечившем подготовку проектной документации'] || '';
-				if (developerInfo.trim().toLowerCase() === 'не требуется') {
-					console.log(`[AI_PROCESS] Запись "${uniqueNumber}" пропущена (застройщик "Не требуется").`);
-					continue;
-				}
-				
-				let messageText = '';
-				
-				// Сначала ищем готовое сообщение в нашем кеше
-				const cachedLead = await ProcessedLead.findOne({ where: { conclusionNumber: uniqueNumber } });
-				
-				if (cachedLead) {
-					console.log(`[AI_PROCESS] Запись "${uniqueNumber}" найдена в кеше.`);
-					messageText = cachedLead.processedMessage;
-				} else {
-					// Если в кеше нет - запускаем полный цикл с AI
-					console.log(`[AI_PROCESS] Запись "${uniqueNumber}" не найдена в кеше. Запуск полной обработки...`);
-					let beneficiaryInfo = 'Скрапинг отключен';
-					if (SCRAPER_ENABLED) {
-						beneficiaryInfo = await findBeneficiaryInfo(developerInfo);
-					} else {
-						console.log(`[AI_PROCESS] Скрапинг отключен в конфигурации. Пропускаем поиск бенефициаров.`);
-					}
-					
-					messageText = await processLeadWithAI(record, region, beneficiaryInfo);
-					
-					// Кешируем только качественный результат от AI
-					if (messageText && (messageText.includes('🏙️') || messageText.includes('🏠'))) {
-						await ProcessedLead.create({ conclusionNumber: uniqueNumber, processedMessage: messageText });
-						console.log(`[AI_PROCESS] Результат для "${uniqueNumber}" сохранен в кеш.`);
-					}
-				}
-				
-				// -----------------------------------------------------------------------------
-				// ШАГ 4: РАССЫЛКА СООБЩЕНИЯ ПОДПИСЧИКАМ
-				// -----------------------------------------------------------------------------
-				console.log(`[SCHEDULER] Шаг 4/5: Рассылка сообщения по записи "${uniqueNumber}"...`);
-				const subscribers = regionToUsersMap.get(region) || [];
-				for (const userId of subscribers) {
-					// Проверяем, не отправляли ли мы этому пользователю эту запись ранее
-					const alreadySent = await ParsedData.findOne({ where: { userId, dataContent: uniqueNumber } });
-					if (!alreadySent) {
-						try {
-							await bot.sendMessage(userId, messageText);
-							await ParsedData.create({ userId, dataContent: uniqueNumber });
-							console.log(`[SCHEDULER] Сообщение по "${uniqueNumber}" успешно отправлено пользователю ${userId}.`);
-						} catch (error: any) {
-							// Если бота заблокировали, ловим ошибку, чтобы не остановить всю рассылку
-							if (error.response && error.response.statusCode === 403) {
-								console.warn(`[SCHEDULER] Не удалось отправить сообщение пользователю ${userId} (вероятно, бот заблокирован).`);
-							} else {
-								console.error(`[SCHEDULER] Ошибка отправки сообщения пользователю ${userId}:`, error.message);
-							}
-						}
-					}
-				}
-			}
-		}
-		
+		await executeMainTask();
 	} catch (error) {
-		console.error('[SCHEDULER] Критическая ошибка в глобальной задаче парсинга:', error);
+		logger.error('[SCHEDULER] КРИТИЧЕСКАЯ ОШИБКА в глобальной задаче парсинга:', error);
 	} finally {
-		// -----------------------------------------------------------------------------
-		// ШАГ 5: СНЯТИЕ БЛОКИРОВКИ
-		// -----------------------------------------------------------------------------
+		const executionTime = Date.now() - taskStartTime;
+		logger.info(`[SCHEDULER] ==================== ЗАДАЧА ЗАВЕРШЕНА (${Math.round(executionTime / 1000)}с) ====================`);
 		isTaskRunning = false;
-		console.log('[SCHEDULER] Шаг 5/5: Задача парсинга завершена. Блокировка снята.');
 	}
 });
 
 // =================================================================================
-// НОВЫЙ БЛОК: Функция для немедленного парсинга по запросу от бота
-// Эту функцию можно будет вызывать из других частей приложения (в нашем случае, из bot.ts)
+// ОСНОВНАЯ ЛОГИКА ВЫПОЛНЕНИЯ ЗАДАЧИ
 // =================================================================================
+async function executeMainTask(): Promise<void> {
+	// Шаг 1: Сбор конфигураций и подготовка данных
+	const regionUserMaps = await collectRegionUserMaps();
+	if (regionUserMaps.length === 0) {
+		logger.info('[SCHEDULER] Нет активных подписок на регионы. Задача завершена.');
+		return;
+	}
+	
+	logger.info(`[SCHEDULER] Найдено уникальных регионов для обработки: ${regionUserMaps.length}`);
+	
+	// Шаг 2: Получение текущей даты для фильтрации
+	const todayMsk = getTodayMoscowDate();
+	logger.info(`[SCHEDULER] Дата для поиска: ${todayMsk}`);
+	
+	// Шаг 3: Обработка каждого региона
+	const results: ProcessingResult[] = [];
+	
+	for (const regionMap of regionUserMaps) {
+		try {
+			const result = await processRegion(regionMap, todayMsk);
+			results.push(result);
+			
+			// Небольшая пауза между регионами для снижения нагрузки
+			await sleep(1000);
+		} catch (error) {
+			logger.error(`[SCHEDULER] Ошибка обработки региона "${regionMap.region}":`, error);
+			results.push({
+				region: regionMap.region,
+				totalRecords: 0,
+				processedRecords: 0,
+				skippedRecords: 0,
+				errorRecords: 1,
+			});
+		}
+	}
+	
+	// Шаг 4: Итоговая статистика
+	logFinalStatistics(results);
+}
 
-/**
- * Выполняет поиск и отправку новых лидов для конкретного пользователя по одному региону.
- * @param region - Название региона (в формате "Название - Код").
- * @param userId - ID пользователя в Telegram.
- */
-export async function triggerImmediateParse(region: string, userId: number) {
-	console.log(`[IMMEDIATE_PARSE] Запуск немедленного парсинга для пользователя ${userId} по региону "${region}"`);
+// =================================================================================
+// СБОР КОНФИГУРАЦИЙ И ГРУППИРОВКА ПО РЕГИОНАМ
+// =================================================================================
+async function collectRegionUserMaps(): Promise<RegionUserMap[]> {
+	logger.info('[SCHEDULER] Шаг 1/5: Сбор конфигураций пользователей...');
 	
 	try {
-		const todayMsk = '2024-05-20'; // Для тестов
-		// const todayMsk = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).toISOString().split('T')[0];
-		
-		const filter = `(date(ExpertiseConclusionDate) ge ${todayMsk}Z and date(ExpertiseConclusionDate) le ${todayMsk}T23:59:59.999Z and contains(tolower(SubjectRf),tolower('${region}')))`;
-		
-		const response = await axios.get('https://open-api.egrz.ru/api/PublicRegistrationBook/openDataFile', {
-			params: { $filter: filter, $top: 100 },
-			httpsAgent,
+		const allConfigs = await Configuration.findAll({
+			attributes: ['userId', 'configData'],
 		});
 		
-		const cleanedCsv = (response.data as string).split('\n').filter(line => line.trim() && !line.includes('Дата и время генерации файла:') && line.includes(';')).join('\n');
+		const regionToUsersMap = new Map<string, Set<number>>();
+		let validConfigs = 0;
 		
-		if (!cleanedCsv) {
-			await bot.sendMessage(userId, `По региону "${region.split(' - ')[0]}" за сегодня пока нет новых данных.`);
-			return;
+		for (const config of allConfigs) {
+			try {
+				const userConfig: IUserConfig = JSON.parse(config.dataValues.configData);
+				
+				if (userConfig.regions && Array.isArray(userConfig.regions) && userConfig.regions.length > 0) {
+					validConfigs++;
+					for (const region of userConfig.regions) {
+						if (!regionToUsersMap.has(region)) {
+							regionToUsersMap.set(region, new Set());
+						}
+						regionToUsersMap.get(region)!.add(config.dataValues.userId);
+					}
+				}
+			} catch (parseError) {
+				logger.error(`[SCHEDULER] Ошибка парсинга конфигурации пользователя ${config.dataValues.userId}:`, parseError);
+			}
 		}
 		
-		const records: IEgrzRecord[] = parse(cleanedCsv, { columns: true, delimiter: ';', skip_empty_lines: true });
+		const regionUserMaps: RegionUserMap[] = Array.from(regionToUsersMap.entries()).map(([region, userSet]) => ({
+			region,
+			userIds: Array.from(userSet),
+		}));
+		
+		logger.info(`[SCHEDULER] Обработано конфигураций: ${validConfigs}/${allConfigs.length}, уникальных регионов: ${regionUserMaps.length}`);
+		
+		return regionUserMaps;
+	} catch (error) {
+		logger.error('[SCHEDULER] Критическая ошибка при сборе конфигураций:', error);
+		throw error;
+	}
+}
+
+// =================================================================================
+// ОБРАБОТКА ОДНОГО РЕГИОНА
+// =================================================================================
+async function processRegion(regionMap: RegionUserMap, todayMsk: string): Promise<ProcessingResult> {
+	const { region, userIds } = regionMap;
+	
+	logger.info(`[SCHEDULER] Шаг 2/5: Обработка региона "${region}" (подписчиков: ${userIds.length})`);
+	
+	const result: ProcessingResult = {
+		region,
+		totalRecords: 0,
+		processedRecords: 0,
+		skippedRecords: 0,
+		errorRecords: 0,
+	};
+	
+	try {
+		// Получение данных с API ЕГРЗ с повторными попытками
+		const records = await fetchEgrzDataWithRetry(region, todayMsk);
+		result.totalRecords = records.length;
+		
+		if (records.length === 0) {
+			logger.info(`[SCHEDULER] Регион "${region}": новых данных не найдено`);
+			return result;
+		}
+		
+		logger.info(`[SCHEDULER] Регион "${region}": найдено ${records.length} записей для обработки`);
+		
+		// Оптимизированная обработка записей
+		await processRecordsOptimized(records, region, userIds, result);
+		
+		logger.info(`[SCHEDULER] Регион "${region}": обработано=${result.processedRecords}, пропущено=${result.skippedRecords}, ошибок=${result.errorRecords}`);
+		
+	} catch (error) {
+		logger.error(`[SCHEDULER] Критическая ошибка обработки региона "${region}":`, error);
+		result.errorRecords++;
+		throw error;
+	}
+	
+	return result;
+}
+
+// =================================================================================
+// ПОЛУЧЕНИЕ ДАННЫХ С API ЕГРЗ С ПОВТОРНЫМИ ПОПЫТКАМИ
+// =================================================================================
+async function fetchEgrzDataWithRetry(region: string, todayMsk: string): Promise<IEgrzRecord[]> {
+	const filter = `(date(ExpertiseConclusionDate) ge ${todayMsk}Z and date(ExpertiseConclusionDate) le ${todayMsk}T23:59:59.999Z and contains(tolower(SubjectRf),tolower('${region}')))`;
+	
+	for (let attempt = 1; attempt <= SCHEDULER_CONFIG.MAX_RETRIES; attempt++) {
+		try {
+			logger.debug(`[SCHEDULER] Попытка ${attempt}/${SCHEDULER_CONFIG.MAX_RETRIES} получения данных для региона "${region}"`);
+			
+			const response = await axios.get('https://open-api.egrz.ru/api/PublicRegistrationBook/openDataFile', {
+				params: {
+					$filter: filter,
+					$top: SCHEDULER_CONFIG.MAX_RECORDS_PER_REQUEST,
+				},
+				httpsAgent,
+				timeout: SCHEDULER_CONFIG.HTTP_TIMEOUT,
+			});
+			
+			// Очистка и парсинг CSV
+			const cleanedCsv = cleanCsvData(response.data);
+			if (!cleanedCsv) {
+				return [];
+			}
+			
+			const records: IEgrzRecord[] = parse(cleanedCsv, {
+				columns: true,
+				delimiter: ';',
+				skip_empty_lines: true,
+				trim: true,
+			});
+			
+			logger.debug(`[SCHEDULER] Успешно получено ${records.length} записей для региона "${region}"`);
+			return records;
+			
+		} catch (error: any) {
+			const isLastAttempt = attempt === SCHEDULER_CONFIG.MAX_RETRIES;
+			
+			if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+				logger.warn(`[SCHEDULER] Сетевая ошибка для региона "${region}" (попытка ${attempt}): ${error.message}`);
+				
+				if (!isLastAttempt) {
+					logger.info(`[SCHEDULER] Повторная попытка через ${SCHEDULER_CONFIG.RETRY_DELAY / 1000} секунд...`);
+					await sleep(SCHEDULER_CONFIG.RETRY_DELAY);
+					continue;
+				}
+			}
+			
+			if (isLastAttempt) {
+				logger.error(`[SCHEDULER] Все попытки исчерпаны для региона "${region}". Ошибка:`, error.message);
+				throw error;
+			}
+		}
+	}
+	
+	return [];
+}
+
+// =================================================================================
+// ОПТИМИЗИРОВАННАЯ ОБРАБОТКА ЗАПИСЕЙ
+// =================================================================================
+async function processRecordsOptimized(
+	records: IEgrzRecord[],
+	region: string,
+	userIds: number[],
+	result: ProcessingResult,
+): Promise<void> {
+	logger.info(`[SCHEDULER] Шаг 3/5: Оптимизированная обработка ${records.length} записей...`);
+	
+	// Извлекаем все номера заключений
+	const allConclusionNumbers = records
+		.map(record => record['Номер заключения экспертизы'])
+		.filter(num => num && num.trim());
+	
+	if (allConclusionNumbers.length === 0) {
+		logger.warn('[SCHEDULER] Не найдено ни одного валидного номера заключения');
+		return;
+	}
+	
+	// КРИТИЧЕСКОЕ УЛУЧШЕНИЕ: Один запрос вместо N запросов
+	const alreadySentRecords = await ParsedData.findAll({
+		where: {
+			userId: { [Op.in]: userIds },
+			dataContent: { [Op.in]: allConclusionNumbers },
+		},
+		attributes: ['userId', 'dataContent'],
+		raw: true,
+	});
+	
+	// Создаем Set для быстрого поиска отправленных комбинаций
+	const sentCombinations = new Set(
+		alreadySentRecords.map(record => `${record.userId}:${record.dataContent}`),
+	);
+	
+	logger.info(`[SCHEDULER] Найдено уже отправленных записей: ${alreadySentRecords.length}`);
+	
+	// Обрабатываем каждую запись
+	for (const record of records) {
+		try {
+			await processIndividualRecord(record, region, userIds, sentCombinations, result);
+		} catch (error) {
+			logger.error(`[SCHEDULER] Ошибка обработки записи "${record['Номер заключения экспертизы']}":`, error);
+			result.errorRecords++;
+		}
+	}
+}
+
+// =================================================================================
+// ОБРАБОТКА ОТДЕЛЬНОЙ ЗАПИСИ
+// =================================================================================
+async function processIndividualRecord(
+	record: IEgrzRecord,
+	region: string,
+	userIds: number[],
+	sentCombinations: Set<string>,
+	result: ProcessingResult,
+): Promise<void> {
+	const uniqueNumber = record['Номер заключения экспертизы'];
+	if (!uniqueNumber?.trim()) {
+		result.skippedRecords++;
+		return;
+	}
+	
+	// Проверка релевантности записи
+	const developerInfo = record['Сведения о застройщике, обеспечившем подготовку проектной документации'] || '';
+	if (developerInfo.trim().toLowerCase() === 'не требуется') {
+		logger.debug(`[SCHEDULER] Запись "${uniqueNumber}" пропущена (застройщик "Не требуется")`);
+		result.skippedRecords++;
+		return;
+	}
+	
+	// Определяем пользователей, которым еще не отправляли эту запись
+	const usersToSend = userIds.filter(userId =>
+		!sentCombinations.has(`${userId}:${uniqueNumber}`),
+	);
+	
+	if (usersToSend.length === 0) {
+		// Всем уже отправляли
+		return;
+	}
+	
+	logger.debug(`[SCHEDULER] Запись "${uniqueNumber}": найдено ${usersToSend.length} новых получателей`);
+	
+	// Получение или создание сообщения с кешированием
+	const messageText = await getOrCreateProcessedMessage(record, region, uniqueNumber);
+	if (!messageText) {
+		result.skippedRecords++;
+		return;
+	}
+	
+	// Рассылка сообщения новым получателям
+	await sendMessageToUsers(usersToSend, messageText, uniqueNumber, result);
+	
+	result.processedRecords++;
+}
+
+// =================================================================================
+// ПОЛУЧЕНИЕ ИЛИ СОЗДАНИЕ ОБРАБОТАННОГО СООБЩЕНИЯ
+// =================================================================================
+async function getOrCreateProcessedMessage(record: IEgrzRecord, region: string, uniqueNumber: string): Promise<string> {
+	// Проверяем кеш
+	const cachedLead = await ProcessedLead.findOne({
+		where: { conclusionNumber: uniqueNumber },
+		attributes: ['processedMessage'],
+	});
+	
+	if (cachedLead) {
+		logger.debug(`[SCHEDULER] Сообщение для "${uniqueNumber}" найдено в кеше`);
+		return cachedLead.processedMessage;
+	}
+	
+	// Создаем новое сообщение через AI
+	logger.debug(`[SCHEDULER] Создание нового сообщения для "${uniqueNumber}" через AI...`);
+	const messageText = await processLeadWithAI(record, region);
+	
+	// Сохраняем в кеш только валидные сообщения
+	if (messageText && (messageText.includes('🏙️') || messageText.includes('🏠'))) {
+		try {
+			await ProcessedLead.create({
+				conclusionNumber: uniqueNumber,
+				processedMessage: messageText,
+			});
+			logger.debug(`[SCHEDULER] Сообщение для "${uniqueNumber}" сохранено в кеш`);
+		} catch (cacheError) {
+			// Игнорируем ошибки кеширования, но логируем их
+			logger.warn(`[SCHEDULER] Не удалось сохранить в кеш "${uniqueNumber}":`, cacheError);
+		}
+	}
+	
+	return messageText;
+}
+
+// =================================================================================
+// РАССЫЛКА СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЯМ
+// =================================================================================
+async function sendMessageToUsers(userIds: number[], messageText: string, uniqueNumber: string, result: ProcessingResult): Promise<void> {
+	logger.info(`[SCHEDULER] Шаг 4/5: Рассылка сообщения "${uniqueNumber}" для ${userIds.length} пользователей...`);
+	
+	const sendPromises = userIds.map(async (userId) => {
+		try {
+			await bot.sendMessage(userId, messageText);
+			
+			// Записываем факт отправки
+			await ParsedData.create({
+				userId,
+				dataContent: uniqueNumber,
+			});
+			
+			logger.debug(`[SCHEDULER] Сообщение "${uniqueNumber}" успешно отправлено пользователю ${userId}`);
+		} catch (error: any) {
+			if (error.response?.statusCode === 403) {
+				logger.warn(`[SCHEDULER] Пользователь ${userId} заблокировал бота`);
+			} else if (error.response?.statusCode === 400 && error.response?.body?.description?.includes('chat not found')) {
+				logger.warn(`[SCHEDULER] Чат с пользователем ${userId} не найден`);
+			} else {
+				logger.error(`[SCHEDULER] Ошибка отправки сообщения пользователю ${userId}:`, error.message);
+				result.errorRecords++;
+			}
+		}
+	});
+	
+	// Ждем завершения всех отправок
+	await Promise.allSettled(sendPromises);
+}
+
+// =================================================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// =================================================================================
+function getTodayMoscowDate(): string {
+	// В продакшене замените на эту строку:
+	return new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).toISOString().split('T')[0];
+	
+}
+
+function cleanCsvData(rawData: string): string {
+	return rawData
+		.split('\n')
+		.filter(line =>
+			line.trim() &&
+			!line.includes('Дата и время генерации файла:') &&
+			line.includes(';'),
+		)
+		.join('\n');
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function logFinalStatistics(results: ProcessingResult[]): void {
+	const totals = results.reduce((acc, result) => ({
+		totalRecords: acc.totalRecords + result.totalRecords,
+		processedRecords: acc.processedRecords + result.processedRecords,
+		skippedRecords: acc.skippedRecords + result.skippedRecords,
+		errorRecords: acc.errorRecords + result.errorRecords,
+	}), { totalRecords: 0, processedRecords: 0, skippedRecords: 0, errorRecords: 0 });
+	
+	logger.info('[SCHEDULER] ==================== ИТОГОВАЯ СТАТИСТИКА ====================');
+	logger.info(`[SCHEDULER] Обработано регионов: ${results.length}`);
+	logger.info(`[SCHEDULER] Всего записей получено: ${totals.totalRecords}`);
+	logger.info(`[SCHEDULER] Успешно обработано: ${totals.processedRecords}`);
+	logger.info(`[SCHEDULER] Пропущено: ${totals.skippedRecords}`);
+	logger.info(`[SCHEDULER] Ошибок: ${totals.errorRecords}`);
+	logger.info('[SCHEDULER] ================================================================');
+}
+
+// =================================================================================
+// ФУНКЦИЯ НЕМЕДЛЕННОГО ПАРСИНГА (ОБНОВЛЕННАЯ ВЕРСИЯ)
+// =================================================================================
+export async function triggerImmediateParse(region: string, userId: number): Promise<void> {
+	logger.info(`[IMMEDIATE_PARSE] Запуск немедленного парсинга для пользователя ${userId} по региону "${region}"`);
+	
+	try {
+		const todayMsk = getTodayMoscowDate();
+		
+		// Получаем данные с повторными попытками
+		const records = await fetchEgrzDataWithRetry(region, todayMsk);
+		
 		if (records.length === 0) {
 			await bot.sendMessage(userId, `По региону "${region.split(' - ')[0]}" за сегодня пока нет новых данных.`);
 			return;
 		}
 		
-		// --- ИЗМЕНЕНИЕ: Добавляем счетчики для отправленных и пропущенных записей ---
 		let sentMessagesCount = 0;
-		let skippedRecordsCount = 0; // Новый счетчик
+		let skippedRecordsCount = 0;
+		
+		// Получаем уже отправленные записи для этого пользователя
+		const sentRecords = await ParsedData.findAll({
+			where: {
+				userId,
+				dataContent: { [Op.in]: records.map(r => r['Номер заключения экспертизы']).filter(Boolean) },
+			},
+			attributes: ['dataContent'],
+			raw: true,
+		});
+		
+		const sentNumbers = new Set(sentRecords.map(r => r.dataContent));
 		
 		for (const record of records) {
 			const uniqueNumber = record['Номер заключения экспертизы'];
@@ -298,31 +526,15 @@ export async function triggerImmediateParse(region: string, userId: number) {
 			
 			const developerInfo = record['Сведения о застройщике, обеспечившем подготовку проектной документации'] || '';
 			if (developerInfo.trim().toLowerCase() === 'не требуется') {
-				skippedRecordsCount++; // Увеличиваем счетчик пропущенных
-				console.log(`[IMMEDIATE_PARSE] Запись "${uniqueNumber}" пропущена (застройщик "Не требуется").`);
+				skippedRecordsCount++;
 				continue;
 			}
 			
-			const alreadySent = await ParsedData.findOne({ where: { userId, dataContent: uniqueNumber } });
-			if (alreadySent) {
-				continue;
+			if (sentNumbers.has(uniqueNumber)) {
+				continue; // Уже отправляли этому пользователю
 			}
 			
-			let messageText = '';
-			const cachedLead = await ProcessedLead.findOne({ where: { conclusionNumber: uniqueNumber } });
-			
-			if (cachedLead) {
-				messageText = cachedLead.processedMessage;
-			} else {
-				let beneficiaryInfo = 'Скрапинг отключен';
-				if (SCRAPER_ENABLED) {
-					beneficiaryInfo = await findBeneficiaryInfo(developerInfo);
-				}
-				messageText = await processLeadWithAI(record, region, beneficiaryInfo);
-				if (messageText && (messageText.includes('🏙️') || messageText.includes('🏠'))) {
-					await ProcessedLead.create({ conclusionNumber: uniqueNumber, processedMessage: messageText });
-				}
-			}
+			const messageText = await getOrCreateProcessedMessage(record, region, uniqueNumber);
 			
 			if (messageText) {
 				try {
@@ -330,16 +542,16 @@ export async function triggerImmediateParse(region: string, userId: number) {
 					await ParsedData.create({ userId, dataContent: uniqueNumber });
 					sentMessagesCount++;
 				} catch (error: any) {
-					if (error.response && error.response.statusCode === 403) {
-						console.warn(`[IMMEDIATE_PARSE] Не удалось отправить сообщение пользователю ${userId} (вероятно, бот заблокирован).`);
+					if (error.response?.statusCode === 403) {
+						logger.warn(`[IMMEDIATE_PARSE] Пользователь ${userId} заблокировал бота`);
 					} else {
-						console.error(`[IMMEDIATE_PARSE] Ошибка отправки сообщения пользователю ${userId}:`, error.message);
+						logger.error(`[IMMEDIATE_PARSE] Ошибка отправки сообщения пользователю ${userId}:`, error.message);
 					}
 				}
 			}
 		}
 		
-		// --- ИЗМЕНЕНИЕ: Новая логика финального сообщения ---
+		// Отправляем итоговое сообщение
 		let finalMessage = '';
 		if (sentMessagesCount > 0) {
 			finalMessage = `✅ Первоначальный поиск завершен. Отправлено новых записей: ${sentMessagesCount}.`;
@@ -348,16 +560,16 @@ export async function triggerImmediateParse(region: string, userId: number) {
 			}
 		} else {
 			if (skippedRecordsCount > 0) {
-				finalMessage = `✅ Первоначальный поиск завершен. Новых записей для отправки нет, т.к. найденные ${skippedRecordsCount} шт. были нерелевантны (например, без указания застройщика).`;
+				finalMessage = `✅ Первоначальный поиск завершен. Новых записей для отправки нет, т.к. найденные ${skippedRecordsCount} шт. были нерелевантны.`;
 			} else {
-				finalMessage = '✅ Первоначальный поиск завершен. Все найденные записи уже были отправлены вам ранее. Новых лидов нет.';
+				finalMessage = '✅ Первоначальный поиск завершен. Все найденные записи уже были отправлены вам ранее.';
 			}
 		}
 		
 		await bot.sendMessage(userId, finalMessage);
 		
 	} catch (error) {
-		console.error(`[IMMEDIATE_PARSE] Критическая ошибка при немедленном парсинге для ${userId}:`, error);
+		logger.error(`[IMMEDIATE_PARSE] Критическая ошибка при немедленном парсинге для ${userId}:`, error);
 		await bot.sendMessage(userId, '❌ При поиске произошла ошибка. Попробуйте добавить регион еще раз или обратитесь к администратору.');
 	}
 }

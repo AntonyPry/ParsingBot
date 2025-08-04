@@ -1,20 +1,20 @@
 import { sequelize } from './database';
-import { PORT } from './config';
+import { config } from './config';
 import { app } from './app';
 import './bot';
 import './scheduler';
+import { logger } from './logger';
 
 (async () => {
 	try {
 		// Подключаемся к БД
 		await sequelize.authenticate();
-		console.log('Подключено к БД');
+		logger.info('Подключено к БД');
 
-		// Если используем Express
-		app.listen(PORT || 5000, () => {
-			console.log(`Сервер запущен на порту ${PORT}`);
+		app.listen(config.PORT || 5000, () => {
+			logger.info(`Сервер запущен на порту ${config.PORT}`);
 		});
 	} catch (error) {
-		console.error('Ошибка при подключении к БД:', error);
+		logger.error('Ошибка при подключении к БД:', error);
 	}
 })();
