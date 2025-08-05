@@ -39,8 +39,6 @@ const sequelizeConfig = {
 	// Таймауты
 	dialectOptions: {
 		connectTimeout: 60000, // 60 секунд на подключение
-		acquireTimeout: 60000, // 60 секунд на получение соединения
-		timeout: 60000,        // 60 секунд на выполнение запроса
 	},
 };
 

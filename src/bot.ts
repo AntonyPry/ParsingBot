@@ -47,6 +47,10 @@ const USER_KEYBOARD = {
 	},
 };
 
+const GUEST_KEYBOARD = {
+	reply_markup: { keyboard: [[{ text: '/start' }]], resize_keyboard: true }
+};
+
 // Set для быстрой проверки
 const COMMAND_BUTTONS = new Set([
 	'➕ Добавить регион', '➖ Удалить регион', 'Мои регионы',
@@ -57,39 +61,111 @@ function isAdmin(userId: number): boolean {
 	return config.ADMIN_TELEGRAM_IDS.includes(userId);
 }
 
-async function hasAccess(userId: number, username?: string): Promise<boolean> {
-	if (isAdmin(userId)) {
-		return true;
-	}
-	
-	// не ищем по userId, если он null/undefined
-	if (userId) {
-		const user = await User.findOne({ where: { userId } });
-		if (user) return true;
-	}
-	
-	// Если по ID не нашли и есть username, ищем по нему
-	if (username) {
-		const user = await User.findOne({ where: { username } });
-		return !!user;
-	}
-	
-	return false;
+async function isRegistered(username?: string): Promise<boolean> {
+	if (!username) return false;
+	const user = await User.findOne({ where: { username } });
+	return !!user;
+}
+
+async function isActivated(userId: number): Promise<boolean> {
+	const user = await User.findOne({ where: { userId } });
+	return !!user;
+}
+
+async function hasAccess(userId: number, username?: string): Promise<'admin' | 'activated' | 'registered' | 'none'> {
+	if (isAdmin(userId)) return 'admin';
+	if (await isActivated(userId)) return 'activated';
+	if (await isRegistered(username)) return 'registered';
+	return 'none';
 }
 
 bot.on('message', async (msg) => {
-	try {
-		const chatId = msg.chat.id;
-		const text = (msg.text || '').trim();
+	const chatId = msg.chat.id;
+	const username = msg.from?.username;
+	const text = (msg.text || '').trim();
+	
+	// === 1) Всегда обрабатываем /start первым, до гейткипера ===
+	if (text === '/start') {
+		// Ищем пользователя по username
+		const userInDb = username
+			? await User.findOne({ where: { username } })
+			: null;
 		
-		// --- Главный гейткипер ---
-		if (!(await hasAccess(chatId, msg.from?.username))) {
-			await bot.sendMessage(chatId, 'У вас нет доступа к этому боту.');
-			logger.warn(
-				`[AUTH] Пользователь ${chatId} (${msg.from?.username}) попытался получить несанкционированный доступ.`,
-			);
-			return;
+		// Если он был в списке ожидания, активируем
+		if (userInDb && !userInDb.userId) {
+			userInDb.userId = chatId;
+			await userInDb.save();
+			
+			const welcomeMsg = isAdmin(chatId)
+				? 'Добро пожаловать, администратор! Расширенные функции доступны.'
+				: 'Ваш доступ к боту активирован! Используйте кнопки ниже.';
+			const kb = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
+			
+			await bot.sendMessage(chatId, welcomeMsg, kb);
+		} else {
+			// Новый пользователь или уже активирован
+			const access = isAdmin(chatId) || await isActivated(chatId)
+				? 'ok' : 'wait';
+			if (access === 'ok') {
+				const kb = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
+				await bot.sendMessage(
+					chatId,
+					isAdmin(chatId)
+						? 'Вы уже администратор, выбирайте команду.'
+						: 'Вы уже активированы, выбирайте команду.',
+					kb
+				);
+			} else {
+				// Нет в списке и не админ — просим запросить доступ
+				await bot.sendMessage(
+					chatId,
+					'У вас нет доступа. При получении доступа повторно нажмите /start',
+					GUEST_KEYBOARD
+				);
+			}
 		}
+		return; // дальше в этом апдейте текста не пускаем
+	}
+	
+	// === 2) Гейткипер для всего остального ===
+	const access = await hasAccess(chatId, username);
+	if (access !== 'admin' && access !== 'activated') {
+		// Показываем только кнопку /start
+		await bot.sendMessage(
+			chatId,
+			access === 'registered'
+				? 'Пожалуйста, нажмите /start для активации доступа.'
+				: 'У вас нет доступа. При получении доступа повторно нажмите /start',
+			GUEST_KEYBOARD
+		);
+		return;
+	}
+	
+	try {
+		// const chatId = msg.chat.id;
+		// const text = (msg.text || '').trim();
+		//
+		// // --- Главный гейткипер ---
+		// if (!(await hasAccess(chatId, msg.from?.username))) {
+		// 	await bot.sendMessage(chatId, 'У вас нет доступа к этому боту.');
+		// 	logger.warn(
+		// 		`[AUTH] Пользователь ${chatId} (${msg.from?.username}) попытался получить несанкционированный доступ.`,
+		// 	);
+		// 	return;
+		// }
+		
+		// const access = await hasAccess(chatId, msg.from?.username);
+		//
+		// if (access === 'none' || access === 'registered') {
+		// 	// гость или ещё не нажал /start
+		// 	await bot.sendMessage(chatId,
+		// 		access === 'registered'
+		// 			? 'Пожалуйста, нажмите /start для активации.'
+		// 			: 'У вас нет доступа. При получении доступа повторно нажмите /start',
+		// 		GUEST_KEYBOARD
+		// 	);
+		// 	return;
+		// }
 		
 		// --- Обработка ожидаемых действий (добавление региона, ожидание пересылки) ---
 		if (userAction.has(chatId)) {
