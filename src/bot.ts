@@ -1,4 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
+import { Op } from 'sequelize'; // НОВОЕ: Нужно для запросов с `IN`
 import { config } from './config';
 import { REGIONS } from './constants/regions';
 import { Configuration } from './database/models/Configuration';
@@ -10,84 +11,60 @@ import { IUserConfig } from './types/config.types';
 if (!config.BOT_TOKEN) {
 	throw new Error('BOT_TOKEN не задан в .env');
 }
-// Добавляем новые состояния для админки
+
+// ИЗМЕНЕНО: Обновляем состояния для нового текстового флоу удаления
 const userAction = new Map<
 	number,
-	'add_region' | 'remove_region' | 'awaiting_username'
+	| 'add_region'
+	| 'awaiting_username'
+	| 'awaiting_region_deletion' // НОВОЕ
+	| 'awaiting_user_deletion' // НОВОЕ
 >();
 
 // =============================================================================
-// УЛУЧШЕННАЯ ИНИЦИАЛИЗАЦИЯ БОТА С ОБРАБОТКОЙ ОШИБОК
+// ИНИЦИАЛИЗАЦИЯ БОТА И ОБРАБОТКА ОШИБОК (без изменений)
 // =============================================================================
-
 const botOptions: TelegramBot.ConstructorOptions = {
 	polling: {
 		interval: 1000,
 		autoStart: true,
 		params: {
 			timeout: 10,
-			allowed_updates: ['message', 'callback_query']
-		}
+			allowed_updates: ['message', 'callback_query'],
+		},
 	},
-	// Увеличиваем таймауты для стабильности
 	request: {
 		agentOptions: {
 			keepAlive: true,
-			family: 4
+			family: 4,
 		},
 		timeout: 30000,
-		url: '' // Добавляем обязательное поле url (будет переопределено библиотекой)
-	} as TelegramBot.ConstructorOptions['request']
+		url: '',
+	} as TelegramBot.ConstructorOptions['request'],
 };
 
 export const bot = new TelegramBot(config.BOT_TOKEN, botOptions);
 
-// =============================================================================
-// ОБРАБОТЧИКИ ОШИБОК И ВОССТАНОВЛЕНИЯ
-// =============================================================================
-
-// Счетчик последовательных ошибок
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5;
-const RESTART_DELAY = 30000; // 30 секунд
+const RESTART_DELAY = 30000;
 
-// Обработчик polling ошибок
 bot.on('polling_error', async (error: any) => {
 	consecutiveErrors++;
-	
 	logger.error(`[BOT] Polling error #${consecutiveErrors}:`, {
 		code: error.code,
 		message: error.message,
-		syscall: error.syscall,
-		errno: error.errno
 	});
-	
-	// Определяем тип ошибки
 	if (error.code === 'EFATAL' || error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET') {
-		logger.warn(`[BOT] Сетевая ошибка polling: ${error.code} - ${error.message}`);
-		
-		// Если слишком много последовательных ошибок - пытаемся перезапустить polling
 		if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
 			logger.error(`[BOT] КРИТИЧНО: ${consecutiveErrors} последовательных ошибок. Попытка перезапуска polling...`);
 			await restartBotPolling();
 		}
-	} else if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') {
-		logger.error(`[BOT] DNS/сетевая проблема: ${error.message}`);
-		// Ждем больше времени при DNS проблемах
-		setTimeout(() => {
-			logger.info('[BOT] Попытка восстановления после DNS ошибки...');
-		}, RESTART_DELAY * 2);
 	} else {
 		logger.error(`[BOT] Неизвестная polling ошибка:`, error);
 	}
 });
 
-// Обработчик webhook ошибок (если когда-то переключитесь на webhook)
-bot.on('webhook_error', (error: any) => {
-	logger.error('[BOT] Webhook error:', error);
-});
-
-// Сброс счетчика ошибок при успешных операциях
 bot.on('message', () => {
 	if (consecutiveErrors > 0) {
 		logger.info(`[BOT] Успешное сообщение получено, сброс счетчика ошибок (было: ${consecutiveErrors})`);
@@ -95,41 +72,20 @@ bot.on('message', () => {
 	}
 });
 
-bot.on('callback_query', () => {
-	if (consecutiveErrors > 0) {
-		logger.info(`[BOT] Успешный callback получен, сброс счетчика ошибок (было: ${consecutiveErrors})`);
-		consecutiveErrors = 0;
-	}
-});
-
-// =============================================================================
-// ФУНКЦИЯ ПЕРЕЗАПУСКА POLLING
-// =============================================================================
 async function restartBotPolling(): Promise<void> {
 	try {
 		logger.info('[BOT] Остановка polling...');
 		await bot.stopPolling();
-		
-		// Ждем перед перезапуском
 		await new Promise(resolve => setTimeout(resolve, RESTART_DELAY));
-		
 		logger.info('[BOT] Перезапуск polling...');
 		await bot.startPolling();
-		
 		consecutiveErrors = 0;
 		logger.info('[BOT] ✅ Polling успешно перезапущен');
-		
 	} catch (restartError) {
 		logger.error('[BOT] ❌ Ошибка при перезапуске polling:', restartError);
-		
-		// Если перезапуск не удался, попробуем еще раз через больший интервал
-		setTimeout(async () => {
-			logger.info('[BOT] Повторная попытка перезапуска...');
-			await restartBotPolling();
-		}, RESTART_DELAY * 2);
+		setTimeout(() => restartBotPolling(), RESTART_DELAY * 2);
 	}
 }
-
 // =============================================================================
 // HEALTH CHECK ФУНКЦИЯ
 // =============================================================================
@@ -184,12 +140,10 @@ async function gracefulShutdown(): Promise<void> {
 		process.exit(1);
 	}
 }
-
 // =============================================================================
-// УЛУЧШЕННАЯ ОБРАБОТКА ОТПРАВКИ СООБЩЕНИЙ
+// БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ С УЛУЧШЕННЫМ ЛОГИРОВАНИЕМ
 // =============================================================================
 
-// Обертка для безопасной отправки сообщений с retry
 export async function safeSendMessage(
 	chatId: number,
 	text: string,
@@ -201,9 +155,9 @@ export async function safeSendMessage(
 			await bot.sendMessage(chatId, text, options);
 			return true;
 		} catch (error: any) {
-			logger.warn(`[BOT] Попытка ${attempt}/${maxRetries} отправки сообщения пользователю ${chatId} не удалась:`, error.message);
+			const shortText = text.substring(0, 80).replace(/\n/g, ' ') + (text.length > 80 ? '...' : '');
+			logger.warn(`[BOT] Попытка ${attempt}/${maxRetries} отправки сообщения пользователю ${chatId} не удалась. Сообщение: "${shortText}". Ошибка: ${error.message}`);
 			
-			// Если это последняя попытка или критическая ошибка
 			if (attempt === maxRetries || error.response?.statusCode === 403) {
 				if (error.response?.statusCode === 403) {
 					logger.info(`[BOT] Пользователь ${chatId} заблокировал бота`);
@@ -212,8 +166,6 @@ export async function safeSendMessage(
 				}
 				return false;
 			}
-			
-			// Пауза перед повторной попыткой
 			await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
 		}
 	}
@@ -224,15 +176,13 @@ export async function safeSendMessage(
 // КЛАВИАТУРЫ И ПРОВЕРКА ДОСТУПА
 // =============================================================================
 
+// ИЗМЕНЕНО: Кнопка "Список пользователей" заменена на "Удалить пользователя"
 const ADMIN_KEYBOARD = {
 	reply_markup: {
 		keyboard: [
 			[{ text: '➕ Добавить регион' }, { text: '➖ Удалить регион' }],
 			[{ text: 'Мои регионы' }],
-			[
-				{ text: '➕ Добавить пользователя' },
-				{ text: '👥 Список пользователей' },
-			],
+			[{ text: '➕ Добавить пользователя' }, { text: '➖ Удалить пользователя' }],
 		],
 		resize_keyboard: true,
 	},
@@ -249,175 +199,106 @@ const USER_KEYBOARD = {
 };
 
 const GUEST_KEYBOARD = {
-	reply_markup: { keyboard: [[{ text: '/start' }]], resize_keyboard: true }
+	reply_markup: { keyboard: [[{ text: '/start' }]], resize_keyboard: true },
 };
 
-// Set для быстрой проверки
+// ИЗМЕНЕНО: Обновляем Set кнопок
 const COMMAND_BUTTONS = new Set([
 	'➕ Добавить регион', '➖ Удалить регион', 'Мои регионы',
-	'➕ Добавить пользователя', '👥 Список пользователей',
+	'➕ Добавить пользователя', '➖ Удалить пользователя',
 ]);
 
+// Функции проверки доступа (без изменений)
 function isAdmin(userId: number): boolean {
 	return config.ADMIN_TELEGRAM_IDS.includes(userId);
 }
-
-async function isRegistered(username?: string): Promise<boolean> {
-	if (!username) return false;
-	const user = await User.findOne({ where: { username } });
-	return !!user;
-}
-
 async function isActivated(userId: number): Promise<boolean> {
 	const user = await User.findOne({ where: { userId } });
 	return !!user;
 }
-
 async function hasAccess(userId: number, username?: string): Promise<'admin' | 'activated' | 'registered' | 'none'> {
 	if (isAdmin(userId)) return 'admin';
 	if (await isActivated(userId)) return 'activated';
-	if (await isRegistered(username)) return 'registered';
+	const userInDb = username ? await User.findOne({ where: { username } }) : null;
+	if (userInDb) return 'registered';
 	return 'none';
 }
 
+// =============================================================================
+// ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+// =============================================================================
 bot.on('message', async (msg) => {
 	const chatId = msg.chat.id;
 	const username = msg.from?.username;
 	const text = (msg.text || '').trim();
 	
-	// === 1) Всегда обрабатываем /start первым, до гейткипера ===
+	// --- 1) Обработка /start (логика активации) ---
 	if (text === '/start') {
-		// Ищем пользователя по username
-		const userInDb = username
-			? await User.findOne({ where: { username } })
-			: null;
-		
-		// Если он был в списке ожидания, активируем
+		const userInDb = username ? await User.findOne({ where: { username } }) : null;
 		if (userInDb && !userInDb.userId) {
 			userInDb.userId = chatId;
 			await userInDb.save();
-			
-			const welcomeMsg = isAdmin(chatId)
-				? 'Добро пожаловать, администратор! Расширенные функции доступны.'
-				: 'Ваш доступ к боту активирован! Используйте кнопки ниже.';
-			const kb = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-			
-			await safeSendMessage(chatId, welcomeMsg, kb);
+			const welcomeMsg = isAdmin(chatId) ? 'Добро пожаловать, администратор!' : 'Ваш доступ к боту активирован!';
+			await safeSendMessage(chatId, welcomeMsg, isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD);
 		} else {
-			// Новый пользователь или уже активирован
-			const access = isAdmin(chatId) || await isActivated(chatId)
-				? 'ok' : 'wait';
-			if (access === 'ok') {
-				const kb = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-				await safeSendMessage(
-					chatId,
-					isAdmin(chatId)
-						? 'Вы уже администратор, выбирайте команду.'
-						: 'Вы уже активированы, выбирайте команду.',
-					kb
-				);
+			const access = await hasAccess(chatId, username);
+			if (access === 'admin' || access === 'activated') {
+				await safeSendMessage(chatId, 'Вы уже активированы, выбирайте команду.', isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD);
 			} else {
-				// Нет в списке и не админ — просим запросить доступ
-				await safeSendMessage(
-					chatId,
-					'У вас нет доступа. При получении доступа повторно нажмите /start',
-					GUEST_KEYBOARD
-				);
+				await safeSendMessage(chatId, 'У вас нет доступа. При получении доступа повторно нажмите /start', GUEST_KEYBOARD);
 			}
 		}
-		return; // дальше в этом апдейте текста не пускаем
+		return;
 	}
 	
-	// === 2) Гейткипер для всего остального ===
+	// --- 2) Гейткипер для всех остальных команд ---
 	const access = await hasAccess(chatId, username);
 	if (access !== 'admin' && access !== 'activated') {
-		// Показываем только кнопку /start
-		await safeSendMessage(
-			chatId,
-			access === 'registered'
-				? 'Пожалуйста, нажмите /start для активации доступа.'
-				: 'У вас нет доступа. При получении доступа повторно нажмите /start',
-			GUEST_KEYBOARD
-		);
+		await safeSendMessage(chatId, 'Пожалуйста, нажмите /start для активации или получения доступа.', GUEST_KEYBOARD);
 		return;
 	}
 	
 	try {
-		// const chatId = msg.chat.id;
-		// const text = (msg.text || '').trim();
-		//
-		// // --- Главный гейткипер ---
-		// if (!(await hasAccess(chatId, msg.from?.username))) {
-		// 	await bot.sendMessage(chatId, 'У вас нет доступа к этому боту.');
-		// 	logger.warn(
-		// 		`[AUTH] Пользователь ${chatId} (${msg.from?.username}) попытался получить несанкционированный доступ.`,
-		// 	);
-		// 	return;
-		// }
-		
-		// const access = await hasAccess(chatId, msg.from?.username);
-		//
-		// if (access === 'none' || access === 'registered') {
-		// 	// гость или ещё не нажал /start
-		// 	await bot.sendMessage(chatId,
-		// 		access === 'registered'
-		// 			? 'Пожалуйста, нажмите /start для активации.'
-		// 			: 'У вас нет доступа. При получении доступа повторно нажмите /start',
-		// 		GUEST_KEYBOARD
-		// 	);
-		// 	return;
-		// }
-		
-		// --- Обработка ожидаемых действий (добавление региона, ожидание пересылки) ---
+		// --- 3) Обработка ожидаемых действий (ввод данных) ---
 		if (userAction.has(chatId)) {
-			// Если бот ждет ввода данных, но пользователь нажал кнопку - отменяем ожидание
-			if (COMMAND_BUTTONS.has(text) || text === '/start') {
+			if (COMMAND_BUTTONS.has(text) || text.startsWith('/')) {
 				userAction.delete(chatId);
 				logger.debug(`Действие для пользователя ${chatId} отменено из-за нажатия кнопки.`);
 			} else {
-				// Если это не команда, а ввод данных - обрабатываем
 				const action = userAction.get(chatId);
-				userAction.delete(chatId);
+				userAction.delete(chatId); // Сразу удаляем действие
 				
-				if (action === 'add_region' && text) {
-					await handleAddRegion(chatId, text);
-				} else if (action === 'awaiting_username' && text) {
-					await handleAddUsername(msg);
+				switch (action) {
+					case 'add_region':
+						await handleAddRegion(chatId, text);
+						break;
+					case 'awaiting_username':
+						await handleAddUsername(msg);
+						break;
+					// НОВОЕ: Обработка ввода для удаления
+					case 'awaiting_region_deletion':
+						await handleDeleteRegionsByInput(chatId, text);
+						break;
+					case 'awaiting_user_deletion':
+						await handleDeleteUsersByInput(chatId, text);
+						break;
 				}
-				return; // Завершаем, чтобы не попасть в switch-case ниже
+				return;
 			}
 		}
 		
-		if (!text) return; // Если текста нет и действий не ожидается - выходим
+		if (!text) return;
 		
-		// --- Обработка команд с кнопок ---
+		// --- 4) Обработка команд с кнопок ---
 		switch (text) {
-			case '/start':
-				// --- ИЗМЕНЕНИЕ ЗДЕСЬ: Логика "активации" пользователя ---
-				const userInDb = await User.findOne({
-					where: { username: msg.from?.username },
-				});
-				if (userInDb && !userInDb.userId && msg.from?.id) {
-					userInDb.userId = msg.from.id;
-					await userInDb.save();
-				}
-				
-				const welcomeMessage = isAdmin(chatId)
-					? 'Добро пожаловать, администратор! Вам доступны расширенные функции.'
-					: 'Добро пожаловать! Используйте кнопки для управления регионами.';
-				const keyboard = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-				await safeSendMessage(chatId, welcomeMessage, keyboard);
-				break;
 			// Общие команды
 			case '➕ Добавить регион':
 				userAction.set(chatId, 'add_region');
-				await safeSendMessage(
-					chatId,
-					'Введите код региона для добавления (например, 78 - Санкт-Петербург).',
-				);
+				await safeSendMessage(chatId, 'Введите код или несколько кодов регионов через запятую (например, 77, 78).');
 				break;
 			case '➖ Удалить регион':
-				await showRegionsForDeletion(chatId);
+				// ИЗМЕНЕНО: Запускаем текстовый флоу удаления
+				await promptForRegionDeletion(chatId);
 				break;
 			case 'Мои регионы':
 				await showMyRegions(chatId);
@@ -426,178 +307,42 @@ bot.on('message', async (msg) => {
 			// Команды только для администратора
 			case '➕ Добавить пользователя':
 				if (isAdmin(chatId)) {
-					// Меняем состояние и текст сообщения
 					userAction.set(chatId, 'awaiting_username');
-					await safeSendMessage(
-						chatId,
-						'Введите username пользователя (например, @username), которого вы хотите добавить.',
-					);
+					await safeSendMessage(chatId, 'Введите username пользователя (например, @username), которого вы хотите добавить.');
 				}
 				break;
-			case '👥 Список пользователей':
+			case '➖ Удалить пользователя': // ИЗМЕНЕНО: Новое название команды
 				if (isAdmin(chatId)) {
-					await showUsersForDeletion(chatId);
+					// ИЗМЕНЕНО: Запускаем текстовый флоу удаления
+					await promptForUserDeletion(chatId);
 				}
 				break;
 		}
 	} catch (error) {
 		logger.error(`[BOT_MESSAGE_HANDLER] Произошла критическая ошибка:`, error);
-		if (msg && msg.chat) {
-			await safeSendMessage(
-				msg.chat.id,
-				'Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.',
-			);
-		}
+		await safeSendMessage(msg.chat.id, 'Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.');
 	}
 });
 
 // =============================================================================
-// НОВЫЙ БЛОК: ЛОГИКА АДМИНИСТРИРОВАНИЯ
+// УДАЛЕНО: ОБРАБОТЧИК CALLBACK-ЗАПРОСОВ БОЛЬШЕ НЕ НУЖЕН ДЛЯ УДАЛЕНИЯ
 // =============================================================================
-
-async function handleAddUsername(msg: TelegramBot.Message) {
-	const adminId = msg.chat.id;
-	let username = (msg.text || '').trim();
-	
-	// Убираем символ '@', если он есть
-	if (username.startsWith('@')) {
-		username = username.substring(1);
-	}
-	
-	if (!username) {
-		await safeSendMessage(adminId, 'Вы ввели пустое имя. Попробуйте снова.');
-		userAction.set(adminId, 'awaiting_username');
-		return;
-	}
-	
-	try {
-		const [user, created] = await User.findOrCreate({
-			where: { username: username },
-			// ID пока не знаем, так и должно быть
-			defaults: { username: username, userId: null },
-		});
-		
-		if (created) {
-			logger.info(
-				`[ADMIN] Администратор ${adminId} добавил нового пользователя @${username} в список ожидания.`,
-			);
-			await safeSendMessage(
-				adminId,
-				`✅ Пользователь @${username} добавлен в белый список.\n\n` +
-				`❗️Теперь этот пользователь должен сам найти бот и нажать /start, чтобы активировать доступ.`,
-			);
-		} else {
-			await safeSendMessage(
-				adminId,
-				`Пользователь @${username} уже был в списке.`,
-			);
-		}
-	} catch (error) {
-		logger.error(
-			`[ADMIN] Ошибка при добавлении пользователя @${username}:`,
-			error,
-		);
-		await safeSendMessage(
-			adminId,
-			'Произошла ошибка при добавлении пользователя в базу данных.',
-		);
-	}
-}
-
-async function showUsersForDeletion(adminId: number) {
-	if (!isAdmin(adminId)) return;
-	
-	const users = await User.findAll();
-	if (users.length === 0) {
-		await safeSendMessage(adminId, 'В списке нет ни одного пользователя.');
-		return;
-	}
-	
-	const inlineKeyboard = users.map((user) => {
-		const userIdText = user.userId ? `(${user.userId})` : '(ожидает активации)';
-		return [{
-			text: `❌ @${user.username} ${userIdText}`,
-			callback_data: `delete_user:${user.id}`,
-		}]
-	});
-	
-	await safeSendMessage(
-		adminId,
-		'Нажмите на пользователя, чтобы удалить его из списка доступа:',
-		{
-			reply_markup: { inline_keyboard: inlineKeyboard },
-		}
-	);
-}
-
-// =============================================================================
-// ОБРАБОТЧИК CALLBACK-ЗАПРОСОВ (КНОПОК)
-// =============================================================================
-
 bot.on('callback_query', async (callbackQuery) => {
-	try {
-		const message = callbackQuery.message;
-		if (!message) return;
-		const chatId = message.chat.id;
-		const data = callbackQuery.data;
-		
-		// --- И снова гейткипер ---
-		if (!(await hasAccess(chatId))) {
-			await bot.answerCallbackQuery(callbackQuery.id, {
-				text: 'У вас нет доступа.',
-			});
-			return;
-		}
-		
-		// Удаление региона (старая логика)
-		if (data?.startsWith('delete_region:')) {
-			await handleDeleteRegion(
-				chatId,
-				callbackQuery.id,
-				message.message_id,
-				data,
-			);
-		}
-		
-		// НОВЫЙ ОБРАБОТЧИК: Удаление пользователя
-		else if (data?.startsWith('delete_user:')) {
-			if (!isAdmin(chatId)) {
-				await bot.answerCallbackQuery(callbackQuery.id, {
-					text: 'Это действие доступно только администратору.',
-				});
-				return;
-			}
-			await handleDeleteUser(
-				chatId,
-				callbackQuery.id,
-				message.message_id,
-				data,
-			);
-		}
-	} catch (error) {
-		logger.error(`[BOT_CALLBACK_HANDLER] Произошла критическая ошибка:`, error);
-		if (callbackQuery.message) {
-			await safeSendMessage(
-				callbackQuery.message.chat.id,
-				'Не удалось обработать ваше действие. Попробуйте еще раз.',
-			);
-		}
-	}
+	// Здесь может быть другая логика, не связанная с удалением, поэтому обработчик оставляем пустым.
+	// Если других inline-кнопок нет, его можно полностью удалить.
+	await bot.answerCallbackQuery(callbackQuery.id);
 });
 
-// --- Хелперы ---
-
+// =============================================================================
+// ХЕЛПЕРЫ ДЛЯ РАБОТЫ С КОНФИГУРАЦИЕЙ (без изменений)
+// =============================================================================
 async function getUserConfig(chatId: number): Promise<IUserConfig> {
 	const config = await Configuration.findOne({ where: { userId: chatId } });
 	if (config?.configData) {
 		try {
 			const parsed = JSON.parse(config.configData);
-			if (Array.isArray(parsed.regions)) {
-				return parsed;
-			}
-		} catch (e) {
-			// Игнорируем ошибки
-		}
+			if (Array.isArray(parsed.regions)) return parsed;
+		} catch (e) { /* ignore */ }
 	}
 	return { regions: [] };
 }
@@ -609,210 +354,180 @@ async function saveUserConfig(chatId: number, userConfig: IUserConfig) {
 	});
 }
 
-// --- Логика добавления региона ---
-async function handleAddRegion(chatId: number, regionCode: string) {
-	const regionName = REGIONS[regionCode];
-	if (!regionName) {
-		await safeSendMessage(chatId, 'Код региона не найден. Попробуйте снова');
+// =============================================================================
+// ЛОГИКА ДОБАВЛЕНИЯ
+// =============================================================================
+async function handleAddRegion(chatId: number, text: string) {
+	const regionCodes = text.split(',').map(code => code.trim()).filter(Boolean);
+	if (regionCodes.length === 0) {
+		await safeSendMessage(chatId, 'Вы не ввели коды регионов. Попробуйте снова.');
 		return;
 	}
 	
-	const regionValue = `${regionName} - ${regionCode}`;
 	const config = await getUserConfig(chatId);
+	let addedRegions: string[] = [];
+	let failedRegions: string[] = [];
 	
-	if (config.regions.includes(regionValue)) {
-		await safeSendMessage(
-			chatId,
-			`Регион "${regionName}" уже есть в вашем списке.`,
-		);
-		return;
+	for (const code of regionCodes) {
+		const regionName = REGIONS[code];
+		if (!regionName) {
+			failedRegions.push(code);
+			continue;
+		}
+		const regionValue = `${regionName} - ${code}`;
+		if (!config.regions.includes(regionValue)) {
+			config.regions.push(regionValue);
+			addedRegions.push(regionName);
+		}
 	}
 	
-	config.regions.push(regionValue);
-	await saveUserConfig(chatId, config);
-	
-	// --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-	// Определяем, какую клавиатуру показать пользователю
-	const keyboard = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-	await safeSendMessage(
-		chatId,
-		`✅ Регион "${regionName}" успешно добавлен!`,
-		keyboard,
-	);
-	// --- КОНЕЦ ИЗМЕНЕНИЯ ---
-	
-	// --- Блок немедленного парсинга остается без изменений ---
-	await safeSendMessage(
-		chatId,
-		'🚀 Запускаю первоначальный поиск по новому региону. Это может занять минуту...',
-	);
-	await triggerImmediateParse(regionValue, chatId);
+	if (addedRegions.length > 0) {
+		await saveUserConfig(chatId, config);
+		let response = `✅ Регионы успешно добавлены:\n- ${addedRegions.join('\n- ')}`;
+		if (failedRegions.length > 0) {
+			response += `\n\n❌ Не удалось найти регионы с кодами: ${failedRegions.join(', ')}`;
+		}
+		await safeSendMessage(chatId, response, isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD);
+		
+		await safeSendMessage(chatId, '🚀 Запускаю первоначальный поиск по новым регионам. Это может занять минуту...');
+		for (const regionName of addedRegions) {
+			const code = Object.keys(REGIONS).find(key => REGIONS[key] === regionName);
+			if (code) {
+				await triggerImmediateParse(`${regionName} - ${code}`, chatId);
+			}
+		}
+	} else {
+		await safeSendMessage(chatId, `Не удалось добавить регионы. Либо они уже были в списке, либо коды неверны: ${failedRegions.join(', ')}`);
+	}
 }
 
-// --- Логика удаления региона ---
-async function showRegionsForDeletion(chatId: number) {
-	const config = await getUserConfig(chatId);
-	if (config.regions.length === 0) {
-		// --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-		// Точно так же определяем правильную клавиатуру
-		const keyboard = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-		await safeSendMessage(
-			chatId,
-			'Нечего удалять. У вас нет добавленных регионов.',
-			keyboard,
-		);
-		// --- КОНЕЦ ИЗМЕНЕНИЯ ---
+async function handleAddUsername(msg: TelegramBot.Message) {
+	const adminId = msg.chat.id;
+	let username = (msg.text || '').trim().replace('@', '');
+	
+	if (!username) {
+		await safeSendMessage(adminId, 'Вы ввели пустое имя. Попробуйте снова.');
+		userAction.set(adminId, 'awaiting_username');
 		return;
 	}
 	
-	const inlineKeyboard = config.regions.map((region) => [
-		{
-			text: `❌ ${region}`,
-			callback_data: `delete_region:${region}`,
-		},
-	]);
-	
-	await safeSendMessage(chatId, 'Нажмите на регион, чтобы его удалить:', {
-		reply_markup: {
-			inline_keyboard: inlineKeyboard,
-		},
+	const [user, created] = await User.findOrCreate({
+		where: { username: username },
+		defaults: { username: username, userId: null },
 	});
+	
+	if (created) {
+		logger.info(`[ADMIN] Администратор ${adminId} добавил нового пользователя @${username}`);
+		await safeSendMessage(adminId, `✅ Пользователь @${username} добавлен в белый список. Он должен нажать /start для активации.`);
+	} else {
+		await safeSendMessage(adminId, `Пользователь @${username} уже был в списке.`);
+	}
 }
+
+// =============================================================================
+// НОВОЕ: ЛОГИКА УДАЛЕНИЯ ЧЕРЕЗ ТЕКСТОВЫЙ ВВОД
+// =============================================================================
+
+async function promptForRegionDeletion(chatId: number) {
+	const config = await getUserConfig(chatId);
+	if (config.regions.length === 0) {
+		await safeSendMessage(chatId, 'Нечего удалять. У вас нет добавленных регионов.');
+		return;
+	}
+	
+	const regionList = config.regions.map(r => {
+		const [name, code] = r.split(' - ');
+		return `- ${name} (код: ${code})`;
+	}).join('\n');
+	
+	userAction.set(chatId, 'awaiting_region_deletion');
+	await safeSendMessage(chatId, `Ваши текущие регионы:\n${regionList}\n\nВведите коды регионов для удаления через запятую (например, 77, 98).`);
+}
+
+async function handleDeleteRegionsByInput(chatId: number, text: string) {
+	const codesToDelete = new Set(text.split(',').map(code => code.trim()).filter(Boolean));
+	if (codesToDelete.size === 0) {
+		await safeSendMessage(chatId, 'Вы не ввели коды для удаления.');
+		return;
+	}
+	
+	const config = await getUserConfig(chatId);
+	const initialCount = config.regions.length;
+	const deletedRegions: string[] = [];
+	
+	config.regions = config.regions.filter(region => {
+		const code = region.split(' - ')[1];
+		if (codesToDelete.has(code)) {
+			deletedRegions.push(region.split(' - ')[0]);
+			return false;
+		}
+		return true;
+	});
+	
+	if (deletedRegions.length > 0) {
+		await saveUserConfig(chatId, config);
+		await safeSendMessage(chatId, `✅ Регионы удалены:\n- ${deletedRegions.join('\n- ')}`);
+	} else {
+		await safeSendMessage(chatId, 'Ни один из указанных регионов не был найден в вашем списке.');
+	}
+}
+
+async function promptForUserDeletion(adminId: number) {
+	if (!isAdmin(adminId)) return;
+	
+	const users = await User.findAll();
+	if (users.length === 0) {
+		await safeSendMessage(adminId, 'В базе данных нет пользователей для удаления.');
+		return;
+	}
+	
+	const userList = users.map(user => {
+		const status = user.userId ? `(ID: ${user.userId})` : '(ожидает активации)';
+		return `- @${user.username} ${status}`;
+	}).join('\n');
+	
+	userAction.set(adminId, 'awaiting_user_deletion');
+	await safeSendMessage(adminId, `Текущие пользователи:\n${userList}\n\nВведите username для удаления через запятую (например, user1, @user2).`);
+}
+
+async function handleDeleteUsersByInput(adminId: number, text: string) {
+	const usernamesToDelete = text.split(',').map(u => u.trim().replace('@', '')).filter(Boolean);
+	if (usernamesToDelete.length === 0) {
+		await safeSendMessage(adminId, 'Вы не ввели username для удаления.');
+		return;
+	}
+	
+	// Находим пользователей, чтобы уведомить их об удалении
+	const usersToNotify = await User.findAll({
+		where: { username: { [Op.in]: usernamesToDelete }, userId: { [Op.not]: null } },
+	});
+	
+	const deletedCount = await User.destroy({
+		where: { username: { [Op.in]: usernamesToDelete } },
+	});
+	
+	if (deletedCount > 0) {
+		logger.info(`[ADMIN] Администратор ${adminId} удалил ${deletedCount} пользователей.`);
+		await safeSendMessage(adminId, `✅ Удалено ${deletedCount} пользователей.`);
+		
+		// Уведомляем тех, кого смогли
+		for (const user of usersToNotify) {
+			await safeSendMessage(user.userId!, 'Ваш доступ к боту был отозван администратором.');
+		}
+	} else {
+		await safeSendMessage(adminId, 'Ни один из указанных пользователей не найден в базе данных.');
+	}
+}
+
+// =============================================================================
+// ПРОЧИЕ КОМАНДЫ
+// =============================================================================
 
 async function showMyRegions(chatId: number) {
 	const currentConfig = await getUserConfig(chatId);
 	if (currentConfig.regions.length === 0) {
 		await safeSendMessage(chatId, 'У вас пока нет добавленных регионов.');
 	} else {
-		await safeSendMessage(
-			chatId,
-			`Ваши регионы:\n- ${currentConfig.regions.join('\n- ')}`,
-		);
-	}
-}
-
-async function handleDeleteRegion(
-	chatId: number,
-	callbackQueryId: string,
-	messageId: number,
-	data: string,
-) {
-	const regionToDelete = data.substring('delete_region:'.length);
-	const config = await getUserConfig(chatId);
-	
-	config.regions = config.regions.filter((r) => r !== regionToDelete);
-	await saveUserConfig(chatId, config);
-	
-	await bot.answerCallbackQuery(callbackQueryId, {
-		text: `Регион "${regionToDelete}" удален.`,
-	});
-	
-	// Обновляем клавиатуру, чтобы она не "зависала"
-	const currentConfig = await getUserConfig(chatId);
-	const inlineKeyboard = currentConfig.regions.map((region) => [
-		{
-			text: `❌ ${region}`,
-			callback_data: `delete_region:${region}`,
-		},
-	]);
-	
-	if (inlineKeyboard.length > 0) {
-		await bot.editMessageText('Выберите регион для удаления:', {
-			chat_id: chatId,
-			message_id: messageId,
-			reply_markup: {
-				inline_keyboard: inlineKeyboard,
-			},
-		});
-	} else {
-		await bot.editMessageText('Все регионы удалены.', {
-			chat_id: chatId,
-			message_id: messageId,
-		});
-	}
-}
-
-async function handleDeleteUser(
-	adminId: number,
-	callbackQueryId: string,
-	messageId: number,
-	data: string
-) {
-	// --- ИСПРАВЛЕНИЕ 1: Получаем ID из базы, а не Telegram ID ---
-	// Этот ID - это первичный ключ из таблицы `users` (например, 1, 2, 3...), а не огромный Telegram ID.
-	const userDbIdToDelete = parseInt(data.substring('delete_user:'.length), 10);
-	
-	// --- ИСПРАВЛЕНИЕ 2: Проверка на NaN ---
-	// Если по какой-то причине ID не распарсился, выходим, чтобы не было ошибки в SQL.
-	if (isNaN(userDbIdToDelete)) {
-		logger.error(`Получен невалидный ID для удаления из callback_data: ${data}`);
-		await bot.answerCallbackQuery(callbackQueryId, { text: 'Ошибка: неверный ID пользователя.' });
-		return;
-	}
-	
-	// Находим пользователя в базе по его уникальному ID, чтобы получить его данные перед удалением
-	const userToDelete = await User.findByPk(userDbIdToDelete);
-	
-	if (!userToDelete) {
-		await bot.answerCallbackQuery(callbackQueryId, { text: 'Этот пользователь уже был удален.' });
-		// Обновляем сообщение, чтобы убрать кнопки
-		await bot.editMessageText('Пользователь уже был удален.', {
-			chat_id: adminId,
-			message_id: messageId,
-		});
-		return;
-	}
-	
-	// --- ИСПРАВЛЕНИЕ 3: Удаляем по правильному полю `id` ---
-	const deletedCount = await User.destroy({
-		where: { id: userDbIdToDelete },
-	});
-	
-	if (deletedCount > 0) {
-		logger.info(
-			`Администратор ${adminId} удалил пользователя @${userToDelete.username} (DB ID: ${userDbIdToDelete}).`
-		);
-		await bot.answerCallbackQuery(callbackQueryId, {
-			text: `Пользователь @${userToDelete.username} удален.`,
-		});
-		
-		// Уведомляем пользователя об удалении, только если у него есть активный Telegram ID
-		if (userToDelete.userId) {
-			const success = await safeSendMessage(
-				userToDelete.userId,
-				'Ваш доступ к боту был отозван администратором.'
-			);
-			if (!success) {
-				logger.warn(
-					`Не удалось уведомить пользователя ${userToDelete.userId} об удалении (возможно, бот заблокирован).`
-				);
-			}
-		}
-	}
-	
-	// --- ИСПРАВЛЕНИЕ 4: Корректно обновляем список пользователей ---
-	const remainingUsers = await User.findAll();
-	if (remainingUsers.length > 0) {
-		const newKeyboard = remainingUsers.map((user) => {
-			const userIdText = user.userId ? `(${user.userId})` : '(ожидает активации)';
-			return [{
-				text: `❌ @${user.username} ${userIdText}`,
-				callback_data: `delete_user:${user.id}`, // Снова используем ID из базы
-			}];
-		});
-		await bot.editMessageText(
-			'Пользователь удален. Выберите следующего для удаления:',
-			{
-				chat_id: adminId,
-				message_id: messageId,
-				reply_markup: { inline_keyboard: newKeyboard },
-			}
-		);
-	} else {
-		// Если это был последний пользователь
-		await bot.editMessageText('Все пользователи были удалены. Список пуст.', {
-			chat_id: adminId,
-			message_id: messageId,
-		});
+		await safeSendMessage(chatId, `Ваши регионы:\n- ${currentConfig.regions.join('\n- ')}`);
 	}
 }

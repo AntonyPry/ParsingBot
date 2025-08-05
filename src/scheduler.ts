@@ -503,7 +503,7 @@ export async function triggerImmediateParse(region: string, userId: number): Pro
 		const records = await fetchEgrzDataWithRetry(region, todayMsk);
 		
 		if (records.length === 0) {
-			await safeSendMessage(userId, `По региону "${region.split(' - ')[0]}" за сегодня пока нет новых данных.`);
+			await safeSendMessage(userId, `По региону "${region.split(' - ')[0]}" за сегодня пока нет новых данных. В этом канале можно узнать всю информацию о текущем состоянии бота - https://t.me/egrz_sberbot`);
 			return;
 		}
 		
@@ -559,9 +559,10 @@ export async function triggerImmediateParse(region: string, userId: number): Pro
 			}
 		} else {
 			if (skippedRecordsCount > 0) {
-				finalMessage = `✅ Первоначальный поиск завершен. Новых записей для отправки нет, т.к. найденные ${skippedRecordsCount} шт. были нерелевантны.`;
+				finalMessage = `✅ Первоначальный поиск завершен. Новых записей для отправки нет, т.к. найденные ${skippedRecordsCount} шт. были нерелевантны. В этом канале можно узнать всю информацию о текущем состоянии бота - https://t.me/egrz_sberbot`;
 			} else {
-				finalMessage = '✅ Первоначальный поиск завершен. Все найденные записи уже были отправлены вам ранее.';
+				finalMessage = '✅ Первоначальный поиск завершен. Все найденные записи уже были' +
+					' отправлены вам ранее. В этом канале можно узнать всю информацию о текущем состоянии бота - https://t.me/egrz_sberbot';
 			}
 		}
 		
@@ -569,6 +570,7 @@ export async function triggerImmediateParse(region: string, userId: number): Pro
 		
 	} catch (error) {
 		logger.error(`[IMMEDIATE_PARSE] Критическая ошибка при немедленном парсинге для ${userId}:`, error);
-		await safeSendMessage(userId, '❌ При поиске произошла ошибка. Попробуйте добавить регион еще раз или обратитесь к администратору.');
+		await safeSendMessage(userId, '❌ При поиске произошла ошибка. Попробуйте добавить регион еще' +
+			' раз или обратитесь к администратору. В этом канале можно узнать всю информацию о текущем состоянии бота - https://t.me/egrz_sberbot');
 	}
 }
