@@ -10,14 +10,215 @@ import { IUserConfig } from './types/config.types';
 if (!config.BOT_TOKEN) {
 	throw new Error('BOT_TOKEN не задан в .env');
 }
-
 // Добавляем новые состояния для админки
 const userAction = new Map<
 	number,
 	'add_region' | 'remove_region' | 'awaiting_username'
 >();
 
-export const bot = new TelegramBot(config.BOT_TOKEN, { polling: true });
+// =============================================================================
+// УЛУЧШЕННАЯ ИНИЦИАЛИЗАЦИЯ БОТА С ОБРАБОТКОЙ ОШИБОК
+// =============================================================================
+
+const botOptions: TelegramBot.ConstructorOptions = {
+	polling: {
+		interval: 1000,
+		autoStart: true,
+		params: {
+			timeout: 10,
+			allowed_updates: ['message', 'callback_query']
+		}
+	},
+	// Увеличиваем таймауты для стабильности
+	request: {
+		agentOptions: {
+			keepAlive: true,
+			family: 4
+		},
+		timeout: 30000,
+		url: '' // Добавляем обязательное поле url (будет переопределено библиотекой)
+	} as TelegramBot.ConstructorOptions['request']
+};
+
+export const bot = new TelegramBot(config.BOT_TOKEN, botOptions);
+
+// =============================================================================
+// ОБРАБОТЧИКИ ОШИБОК И ВОССТАНОВЛЕНИЯ
+// =============================================================================
+
+// Счетчик последовательных ошибок
+let consecutiveErrors = 0;
+const MAX_CONSECUTIVE_ERRORS = 5;
+const RESTART_DELAY = 30000; // 30 секунд
+
+// Обработчик polling ошибок
+bot.on('polling_error', async (error: any) => {
+	consecutiveErrors++;
+	
+	logger.error(`[BOT] Polling error #${consecutiveErrors}:`, {
+		code: error.code,
+		message: error.message,
+		syscall: error.syscall,
+		errno: error.errno
+	});
+	
+	// Определяем тип ошибки
+	if (error.code === 'EFATAL' || error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET') {
+		logger.warn(`[BOT] Сетевая ошибка polling: ${error.code} - ${error.message}`);
+		
+		// Если слишком много последовательных ошибок - пытаемся перезапустить polling
+		if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+			logger.error(`[BOT] КРИТИЧНО: ${consecutiveErrors} последовательных ошибок. Попытка перезапуска polling...`);
+			await restartBotPolling();
+		}
+	} else if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') {
+		logger.error(`[BOT] DNS/сетевая проблема: ${error.message}`);
+		// Ждем больше времени при DNS проблемах
+		setTimeout(() => {
+			logger.info('[BOT] Попытка восстановления после DNS ошибки...');
+		}, RESTART_DELAY * 2);
+	} else {
+		logger.error(`[BOT] Неизвестная polling ошибка:`, error);
+	}
+});
+
+// Обработчик webhook ошибок (если когда-то переключитесь на webhook)
+bot.on('webhook_error', (error: any) => {
+	logger.error('[BOT] Webhook error:', error);
+});
+
+// Сброс счетчика ошибок при успешных операциях
+bot.on('message', () => {
+	if (consecutiveErrors > 0) {
+		logger.info(`[BOT] Успешное сообщение получено, сброс счетчика ошибок (было: ${consecutiveErrors})`);
+		consecutiveErrors = 0;
+	}
+});
+
+bot.on('callback_query', () => {
+	if (consecutiveErrors > 0) {
+		logger.info(`[BOT] Успешный callback получен, сброс счетчика ошибок (было: ${consecutiveErrors})`);
+		consecutiveErrors = 0;
+	}
+});
+
+// =============================================================================
+// ФУНКЦИЯ ПЕРЕЗАПУСКА POLLING
+// =============================================================================
+async function restartBotPolling(): Promise<void> {
+	try {
+		logger.info('[BOT] Остановка polling...');
+		await bot.stopPolling();
+		
+		// Ждем перед перезапуском
+		await new Promise(resolve => setTimeout(resolve, RESTART_DELAY));
+		
+		logger.info('[BOT] Перезапуск polling...');
+		await bot.startPolling();
+		
+		consecutiveErrors = 0;
+		logger.info('[BOT] ✅ Polling успешно перезапущен');
+		
+	} catch (restartError) {
+		logger.error('[BOT] ❌ Ошибка при перезапуске polling:', restartError);
+		
+		// Если перезапуск не удался, попробуем еще раз через больший интервал
+		setTimeout(async () => {
+			logger.info('[BOT] Повторная попытка перезапуска...');
+			await restartBotPolling();
+		}, RESTART_DELAY * 2);
+	}
+}
+
+// =============================================================================
+// HEALTH CHECK ФУНКЦИЯ
+// =============================================================================
+export async function checkBotHealth(): Promise<boolean> {
+	try {
+		const me = await bot.getMe();
+		logger.debug(`[BOT] Health check OK: ${me.username}`);
+		return true;
+	} catch (error) {
+		logger.error('[BOT] Health check failed:', error);
+		return false;
+	}
+}
+
+// Периодическая проверка здоровья бота (каждые 5 минут)
+setInterval(async () => {
+	const isHealthy = await checkBotHealth();
+	if (!isHealthy) {
+		logger.warn('[BOT] Health check failed, возможны проблемы с ботом');
+		consecutiveErrors++;
+	}
+}, 5 * 60 * 1000);
+
+// =============================================================================
+// GRACEFUL SHUTDOWN
+// =============================================================================
+process.on('SIGTERM', async () => {
+	logger.info('[BOT] Получен SIGTERM, остановка бота...');
+	await gracefulShutdown();
+});
+
+process.on('SIGINT', async () => {
+	logger.info('[BOT] Получен SIGINT, остановка бота...');
+	await gracefulShutdown();
+});
+
+async function gracefulShutdown(): Promise<void> {
+	try {
+		logger.info('[BOT] Graceful shutdown начат...');
+		
+		// Останавливаем polling
+		await bot.stopPolling();
+		logger.info('[BOT] Polling остановлен');
+		
+		// Даем время завершить текущие операции
+		await new Promise(resolve => setTimeout(resolve, 2000));
+		
+		logger.info('[BOT] ✅ Graceful shutdown завершен');
+		process.exit(0);
+	} catch (error) {
+		logger.error('[BOT] Ошибка при graceful shutdown:', error);
+		process.exit(1);
+	}
+}
+
+// =============================================================================
+// УЛУЧШЕННАЯ ОБРАБОТКА ОТПРАВКИ СООБЩЕНИЙ
+// =============================================================================
+
+// Обертка для безопасной отправки сообщений с retry
+export async function safeSendMessage(
+	chatId: number,
+	text: string,
+	options?: TelegramBot.SendMessageOptions,
+	maxRetries: number = 3
+): Promise<boolean> {
+	for (let attempt = 1; attempt <= maxRetries; attempt++) {
+		try {
+			await bot.sendMessage(chatId, text, options);
+			return true;
+		} catch (error: any) {
+			logger.warn(`[BOT] Попытка ${attempt}/${maxRetries} отправки сообщения пользователю ${chatId} не удалась:`, error.message);
+			
+			// Если это последняя попытка или критическая ошибка
+			if (attempt === maxRetries || error.response?.statusCode === 403) {
+				if (error.response?.statusCode === 403) {
+					logger.info(`[BOT] Пользователь ${chatId} заблокировал бота`);
+				} else {
+					logger.error(`[BOT] Не удалось отправить сообщение пользователю ${chatId} после ${maxRetries} попыток`);
+				}
+				return false;
+			}
+			
+			// Пауза перед повторной попыткой
+			await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+		}
+	}
+	return false;
+}
 
 // =============================================================================
 // КЛАВИАТУРЫ И ПРОВЕРКА ДОСТУПА
@@ -101,14 +302,14 @@ bot.on('message', async (msg) => {
 				: 'Ваш доступ к боту активирован! Используйте кнопки ниже.';
 			const kb = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
 			
-			await bot.sendMessage(chatId, welcomeMsg, kb);
+			await safeSendMessage(chatId, welcomeMsg, kb);
 		} else {
 			// Новый пользователь или уже активирован
 			const access = isAdmin(chatId) || await isActivated(chatId)
 				? 'ok' : 'wait';
 			if (access === 'ok') {
 				const kb = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-				await bot.sendMessage(
+				await safeSendMessage(
 					chatId,
 					isAdmin(chatId)
 						? 'Вы уже администратор, выбирайте команду.'
@@ -117,7 +318,7 @@ bot.on('message', async (msg) => {
 				);
 			} else {
 				// Нет в списке и не админ — просим запросить доступ
-				await bot.sendMessage(
+				await safeSendMessage(
 					chatId,
 					'У вас нет доступа. При получении доступа повторно нажмите /start',
 					GUEST_KEYBOARD
@@ -131,7 +332,7 @@ bot.on('message', async (msg) => {
 	const access = await hasAccess(chatId, username);
 	if (access !== 'admin' && access !== 'activated') {
 		// Показываем только кнопку /start
-		await bot.sendMessage(
+		await safeSendMessage(
 			chatId,
 			access === 'registered'
 				? 'Пожалуйста, нажмите /start для активации доступа.'
@@ -205,12 +406,12 @@ bot.on('message', async (msg) => {
 					? 'Добро пожаловать, администратор! Вам доступны расширенные функции.'
 					: 'Добро пожаловать! Используйте кнопки для управления регионами.';
 				const keyboard = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-				await bot.sendMessage(chatId, welcomeMessage, keyboard);
+				await safeSendMessage(chatId, welcomeMessage, keyboard);
 				break;
 			// Общие команды
 			case '➕ Добавить регион':
 				userAction.set(chatId, 'add_region');
-				await bot.sendMessage(
+				await safeSendMessage(
 					chatId,
 					'Введите код региона для добавления (например, 78 - Санкт-Петербург).',
 				);
@@ -227,7 +428,7 @@ bot.on('message', async (msg) => {
 				if (isAdmin(chatId)) {
 					// Меняем состояние и текст сообщения
 					userAction.set(chatId, 'awaiting_username');
-					await bot.sendMessage(
+					await safeSendMessage(
 						chatId,
 						'Введите username пользователя (например, @username), которого вы хотите добавить.',
 					);
@@ -242,7 +443,7 @@ bot.on('message', async (msg) => {
 	} catch (error) {
 		logger.error(`[BOT_MESSAGE_HANDLER] Произошла критическая ошибка:`, error);
 		if (msg && msg.chat) {
-			await bot.sendMessage(
+			await safeSendMessage(
 				msg.chat.id,
 				'Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.',
 			);
@@ -264,7 +465,7 @@ async function handleAddUsername(msg: TelegramBot.Message) {
 	}
 	
 	if (!username) {
-		await bot.sendMessage(adminId, 'Вы ввели пустое имя. Попробуйте снова.');
+		await safeSendMessage(adminId, 'Вы ввели пустое имя. Попробуйте снова.');
 		userAction.set(adminId, 'awaiting_username');
 		return;
 	}
@@ -280,13 +481,13 @@ async function handleAddUsername(msg: TelegramBot.Message) {
 			logger.info(
 				`[ADMIN] Администратор ${adminId} добавил нового пользователя @${username} в список ожидания.`,
 			);
-			await bot.sendMessage(
+			await safeSendMessage(
 				adminId,
 				`✅ Пользователь @${username} добавлен в белый список.\n\n` +
 				`❗️Теперь этот пользователь должен сам найти бот и нажать /start, чтобы активировать доступ.`,
 			);
 		} else {
-			await bot.sendMessage(
+			await safeSendMessage(
 				adminId,
 				`Пользователь @${username} уже был в списке.`,
 			);
@@ -296,7 +497,7 @@ async function handleAddUsername(msg: TelegramBot.Message) {
 			`[ADMIN] Ошибка при добавлении пользователя @${username}:`,
 			error,
 		);
-		await bot.sendMessage(
+		await safeSendMessage(
 			adminId,
 			'Произошла ошибка при добавлении пользователя в базу данных.',
 		);
@@ -308,7 +509,7 @@ async function showUsersForDeletion(adminId: number) {
 	
 	const users = await User.findAll();
 	if (users.length === 0) {
-		await bot.sendMessage(adminId, 'В списке нет ни одного пользователя.');
+		await safeSendMessage(adminId, 'В списке нет ни одного пользователя.');
 		return;
 	}
 	
@@ -320,7 +521,7 @@ async function showUsersForDeletion(adminId: number) {
 		}]
 	});
 	
-	await bot.sendMessage(
+	await safeSendMessage(
 		adminId,
 		'Нажмите на пользователя, чтобы удалить его из списка доступа:',
 		{
@@ -376,7 +577,7 @@ bot.on('callback_query', async (callbackQuery) => {
 	} catch (error) {
 		logger.error(`[BOT_CALLBACK_HANDLER] Произошла критическая ошибка:`, error);
 		if (callbackQuery.message) {
-			await bot.sendMessage(
+			await safeSendMessage(
 				callbackQuery.message.chat.id,
 				'Не удалось обработать ваше действие. Попробуйте еще раз.',
 			);
@@ -412,7 +613,7 @@ async function saveUserConfig(chatId: number, userConfig: IUserConfig) {
 async function handleAddRegion(chatId: number, regionCode: string) {
 	const regionName = REGIONS[regionCode];
 	if (!regionName) {
-		await bot.sendMessage(chatId, 'Код региона не найден. Попробуйте снова');
+		await safeSendMessage(chatId, 'Код региона не найден. Попробуйте снова');
 		return;
 	}
 	
@@ -420,7 +621,7 @@ async function handleAddRegion(chatId: number, regionCode: string) {
 	const config = await getUserConfig(chatId);
 	
 	if (config.regions.includes(regionValue)) {
-		await bot.sendMessage(
+		await safeSendMessage(
 			chatId,
 			`Регион "${regionName}" уже есть в вашем списке.`,
 		);
@@ -433,7 +634,7 @@ async function handleAddRegion(chatId: number, regionCode: string) {
 	// --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
 	// Определяем, какую клавиатуру показать пользователю
 	const keyboard = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-	await bot.sendMessage(
+	await safeSendMessage(
 		chatId,
 		`✅ Регион "${regionName}" успешно добавлен!`,
 		keyboard,
@@ -441,7 +642,7 @@ async function handleAddRegion(chatId: number, regionCode: string) {
 	// --- КОНЕЦ ИЗМЕНЕНИЯ ---
 	
 	// --- Блок немедленного парсинга остается без изменений ---
-	await bot.sendMessage(
+	await safeSendMessage(
 		chatId,
 		'🚀 Запускаю первоначальный поиск по новому региону. Это может занять минуту...',
 	);
@@ -455,7 +656,7 @@ async function showRegionsForDeletion(chatId: number) {
 		// --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
 		// Точно так же определяем правильную клавиатуру
 		const keyboard = isAdmin(chatId) ? ADMIN_KEYBOARD : USER_KEYBOARD;
-		await bot.sendMessage(
+		await safeSendMessage(
 			chatId,
 			'Нечего удалять. У вас нет добавленных регионов.',
 			keyboard,
@@ -471,7 +672,7 @@ async function showRegionsForDeletion(chatId: number) {
 		},
 	]);
 	
-	await bot.sendMessage(chatId, 'Нажмите на регион, чтобы его удалить:', {
+	await safeSendMessage(chatId, 'Нажмите на регион, чтобы его удалить:', {
 		reply_markup: {
 			inline_keyboard: inlineKeyboard,
 		},
@@ -481,9 +682,9 @@ async function showRegionsForDeletion(chatId: number) {
 async function showMyRegions(chatId: number) {
 	const currentConfig = await getUserConfig(chatId);
 	if (currentConfig.regions.length === 0) {
-		await bot.sendMessage(chatId, 'У вас пока нет добавленных регионов.');
+		await safeSendMessage(chatId, 'У вас пока нет добавленных регионов.');
 	} else {
-		await bot.sendMessage(
+		await safeSendMessage(
 			chatId,
 			`Ваши регионы:\n- ${currentConfig.regions.join('\n- ')}`,
 		);
@@ -577,14 +778,13 @@ async function handleDeleteUser(
 		
 		// Уведомляем пользователя об удалении, только если у него есть активный Telegram ID
 		if (userToDelete.userId) {
-			try {
-				await bot.sendMessage(
-					userToDelete.userId,
-					'Ваш доступ к боту был отозван администратором.'
-				);
-			} catch (error: any) {
+			const success = await safeSendMessage(
+				userToDelete.userId,
+				'Ваш доступ к боту был отозван администратором.'
+			);
+			if (!success) {
 				logger.warn(
-					`Не удалось уведомить пользователя ${userToDelete.userId} об удалении (вероятно, бот заблокирован).`
+					`Не удалось уведомить пользователя ${userToDelete.userId} об удалении (возможно, бот заблокирован).`
 				);
 			}
 		}

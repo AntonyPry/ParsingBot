@@ -3,15 +3,15 @@ import * as crypto from 'crypto';
 import { parse } from 'csv-parse/sync';
 import https from 'https';
 import cron from 'node-cron';
-import { bot } from './bot';
+import { Op } from 'sequelize';
+import { safeSendMessage } from './bot';
 import { Configuration } from './database/models/Configuration';
 import { ParsedData } from './database/models/ParsedData';
-import { IEgrzRecord } from './types/egrz.types';
-import { IUserConfig } from './types/config.types';
-import { processLeadWithAI } from './services/aiService';
 import { ProcessedLead } from './database/models/ProcessedLead';
 import { logger } from './logger';
-import { Op } from 'sequelize';
+import { processLeadWithAI } from './services/aiService';
+import { IUserConfig } from './types/config.types';
+import { IEgrzRecord } from './types/egrz.types';
 
 // =================================================================================
 // ВАЖНО: Настройка для совместимости со старым API egrz.ru
@@ -419,15 +419,20 @@ async function sendMessageToUsers(userIds: number[], messageText: string, unique
 	
 	const sendPromises = userIds.map(async (userId) => {
 		try {
-			await bot.sendMessage(userId, messageText);
+			const success = await safeSendMessage(userId, messageText);
 			
-			// Записываем факт отправки
-			await ParsedData.create({
-				userId,
-				dataContent: uniqueNumber,
-			});
-			
-			logger.debug(`[SCHEDULER] Сообщение "${uniqueNumber}" успешно отправлено пользователю ${userId}`);
+			// Записываем факт отправки только если сообщение действительно доставлено
+			if (success) {
+				await ParsedData.create({
+					userId,
+					dataContent: uniqueNumber,
+				});
+				
+				logger.debug(`[SCHEDULER] Сообщение "${uniqueNumber}" успешно отправлено пользователю ${userId}`);
+			} else {
+				logger.warn(`[SCHEDULER] Не удалось отправить сообщение "${uniqueNumber}" пользователю ${userId}`);
+				result.errorRecords++;
+			}
 		} catch (error: any) {
 			if (error.response?.statusCode === 403) {
 				logger.warn(`[SCHEDULER] Пользователь ${userId} заблокировал бота`);
@@ -498,7 +503,7 @@ export async function triggerImmediateParse(region: string, userId: number): Pro
 		const records = await fetchEgrzDataWithRetry(region, todayMsk);
 		
 		if (records.length === 0) {
-			await bot.sendMessage(userId, `По региону "${region.split(' - ')[0]}" за сегодня пока нет новых данных.`);
+			await safeSendMessage(userId, `По региону "${region.split(' - ')[0]}" за сегодня пока нет новых данных.`);
 			return;
 		}
 		
@@ -537,16 +542,10 @@ export async function triggerImmediateParse(region: string, userId: number): Pro
 			const messageText = await getOrCreateProcessedMessage(record, region, uniqueNumber);
 			
 			if (messageText) {
-				try {
-					await bot.sendMessage(userId, messageText);
+				const success = await safeSendMessage(userId, messageText);
+				if (success) {
 					await ParsedData.create({ userId, dataContent: uniqueNumber });
 					sentMessagesCount++;
-				} catch (error: any) {
-					if (error.response?.statusCode === 403) {
-						logger.warn(`[IMMEDIATE_PARSE] Пользователь ${userId} заблокировал бота`);
-					} else {
-						logger.error(`[IMMEDIATE_PARSE] Ошибка отправки сообщения пользователю ${userId}:`, error.message);
-					}
 				}
 			}
 		}
@@ -566,10 +565,10 @@ export async function triggerImmediateParse(region: string, userId: number): Pro
 			}
 		}
 		
-		await bot.sendMessage(userId, finalMessage);
+		await safeSendMessage(userId, finalMessage);
 		
 	} catch (error) {
 		logger.error(`[IMMEDIATE_PARSE] Критическая ошибка при немедленном парсинге для ${userId}:`, error);
-		await bot.sendMessage(userId, '❌ При поиске произошла ошибка. Попробуйте добавить регион еще раз или обратитесь к администратору.');
+		await safeSendMessage(userId, '❌ При поиске произошла ошибка. Попробуйте добавить регион еще раз или обратитесь к администратору.');
 	}
 }
