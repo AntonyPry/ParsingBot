@@ -27,7 +27,7 @@ const userAction = new Map<
 const botOptions: TelegramBot.ConstructorOptions = {
 	polling: {
 		interval: 1000,
-		autoStart: true,
+		autoStart: false,
 		params: {
 			timeout: 10,
 			allowed_updates: ['message', 'callback_query'],
@@ -44,6 +44,16 @@ const botOptions: TelegramBot.ConstructorOptions = {
 };
 
 export const bot = new TelegramBot(config.BOT_TOKEN, botOptions);
+
+setTimeout(async () => {
+    try {
+        logger.info('[BOT] Запуск polling...');
+        await bot.startPolling();
+        logger.info('[BOT] Polling запущен успешно');
+    } catch (error) {
+        logger.error('[BOT] Ошибка запуска polling:', error);
+    }
+}, 1000);
 
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 5;
