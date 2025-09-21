@@ -72,19 +72,38 @@ bot.on('message', () => {
 	}
 });
 
+let isRestarting = false;
 async function restartBotPolling(): Promise<void> {
-	try {
-		logger.info('[BOT] Остановка polling...');
-		await bot.stopPolling();
-		await new Promise(resolve => setTimeout(resolve, RESTART_DELAY));
-		logger.info('[BOT] Перезапуск polling...');
-		await bot.startPolling();
-		consecutiveErrors = 0;
-		logger.info('[BOT] ✅ Polling успешно перезапущен');
-	} catch (restartError) {
-		logger.error('[BOT] ❌ Ошибка при перезапуске polling:', restartError);
-		setTimeout(() => restartBotPolling(), RESTART_DELAY * 2);
-	}
+    if (isRestarting) {
+        logger.warn('[BOT] Перезапуск уже в процессе, пропускаем...');
+        return;
+    }
+    
+    isRestarting = true;
+    
+    try {
+        logger.info('[BOT] Остановка polling...');
+        await bot.stopPolling();
+        
+        // Ждем полной остановки
+        await new Promise(resolve => setTimeout(resolve, RESTART_DELAY));
+        
+        // Проверяем, что polling действительно остановлен
+        logger.info('[BOT] Перезапуск polling...');
+        await bot.startPolling();
+        
+        consecutiveErrors = 0;
+        logger.info('[BOT] ✅ Polling успешно перезапущен');
+        
+    } catch (restartError) {
+        logger.error('[BOT] ❌ Ошибка при перезапуске polling:', restartError);
+        // НЕ делаем рекурсивный вызов - это критично!
+        logger.error('[BOT] Принудительное завершение процесса для перезапуска PM2...');
+        process.exit(1); // Пусть PM2 перезапустит весь процесс
+        
+    } finally {
+        isRestarting = false;
+    }
 }
 // =============================================================================
 // HEALTH CHECK ФУНКЦИЯ
